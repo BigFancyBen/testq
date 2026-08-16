@@ -50,16 +50,16 @@ the first time a client asks for it.
 
 State, the history database and the daemon's own snapshot live in
 `%LOCALAPPDATA%\testq\` — or in `%LOCALAPPDATA%\mfrs-testq\` when that older
-directory exists, which on this box it does. That is deliberate rather than
-untidy: mfrs still carries its own vendored `tools/testq/testq.py`, either copy
-can win the port bind, and the two have to agree on where the history lives or
-the queue's memory would depend on which one happened to start first.
-`TESTQ_HOME` overrides both.
+directory exists, which on this box it does. Keep it that way: that directory
+holds every run this machine has recorded, and the scheduler's estimates are
+medians drawn from it. `TESTQ_HOME` overrides.
 
-While both copies exist, keep this one running (the tray, or a shortcut in
-`shell:startup`) and mfrs will never spawn its own: its client only autostarts a
-daemon when nothing answers on the port. To collapse the two properly, point
-mfrs's `run_lib.sh` autostart line at this file — see UPSTREAM.md.
+mfrs is losing its vendored copy in its PR #94, which points `run_lib.sh` here.
+Until that merges there are two copies of `testq.py` on the box and either can
+win the port bind — harmless, because they share the runtime directory and the
+protocol. Keep this one running (the tray, or a shortcut in `shell:startup`) and
+mfrs will never spawn its own: its client only autostarts a daemon when nothing
+answers on the port.
 
 ## Using it from a project
 

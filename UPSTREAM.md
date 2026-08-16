@@ -49,29 +49,20 @@ it and a vendored copy is still out there using that name.
 
 ## Collapsing the fork
 
-The fork exists because mfrs vendors the daemon. Two ways out, in order of
-preference:
+**In progress: mfrs PR #94** deletes `tools/testq/` and points `run_lib.sh` here
+instead, by walking up from `$PROJ` for `_tools/testq/testq.py` (a walk rather
+than a fixed `../..` because `$PROJ` is a worktree as often as it is the project
+root, and those sit four directories deeper). Nothing else in its client
+changes. Once that merges there is one copy of this file on the machine and this
+document is history.
 
-1. **Point mfrs at this install.** In `run_lib.sh`, the autostart line
+Until it merges nothing is broken either: both copies share the runtime
+directory and the protocol, and whichever daemon is up serves both projects.
+Keep this one running — the tray, or a `shell:startup` shortcut — and mfrs's
+client will never need to spawn its own, because it only autostarts when nothing
+answers on the port.
 
-       python "$PROJ/tools/testq/testq.py" start --port "$TESTQ_PORT"
-
-   becomes a lookup that prefers a shared install and falls back to the vendored
-   copy, e.g.
-
-       TESTQ_PY="${TESTQ_PY:-$PROJ/../_tools/testq/testq.py}"
-       [ -f "$TESTQ_PY" ] || TESTQ_PY="$PROJ/tools/testq/testq.py"
-       python "$TESTQ_PY" start --port "$TESTQ_PORT"
-
-   mfrs can then delete `tools/testq/` whenever suits, and until it does, the
-   only copy that ever starts a daemon is this one.
-
-2. **Upstream these changes into mfrs and vendor from there.** They apply
-   cleanly and are all additive. This is more work for the same result and
-   leaves the queue owned by a project it outgrew.
-
-Until either happens, nothing is broken: both copies share the runtime directory
-and the protocol, and whichever daemon is up serves both projects. Keep this one
-running — the tray, or a `shell:startup` shortcut — and mfrs's client will never
-need to spawn its own, because it only autostarts when nothing answers on the
-port.
+**Keep the legacy runtime directory support regardless of #94.** It is not about
+the fork: `%LOCALAPPDATA%\mfrs-testq` is where the accumulated run history
+actually lives on this box, and the scheduler's estimates are medians drawn from
+it. Renaming the directory would throw that away for no gain.
