@@ -96,6 +96,30 @@ to wait says so:
     [testq] nothing has launched yet; watch http://localhost:43117/
     [testq] got the box after 184s -- starting
 
+### What the grant tells you back
+
+A granted slot carries the number of engines this box is committed to carrying
+while you run, yours included: `slot.boxEngines` in Node, `$TESTQ_BOX_ENGINES`
+in bash, which `run_lib.sh` exports into the environment so the engine itself
+can read it with `OS.get_environment()`. It is `0` when nobody can say —
+unqueued, `TESTQ=off`, or a daemon too old to send the field.
+
+It exists for wall-clock assertions, and it answers a different question from
+"did the queue overload the box". A `run_test_par.sh 4` is granted the whole
+machine and is *still* four engines deep in its own shards — mfrs's sound-bank
+load budget failed at 577 ms exactly that way, with the queue having granted
+correctly and nothing else on the box. The queue was right and the measurement
+was worthless. So a test that times anything should assert only at `1`, and
+should treat `0` as assert-anyway: infrastructure that silently drops
+assertions is worse than the flake it would be dodging.
+
+The number is fixed at the grant, which makes it a floor rather than a promise
+— a one-slot job can still be joined later by whatever the three free slots
+allow. The cases that cannot be joined, a job booking every slot or an
+exclusive one, are exact. A run that knows its own engine count should raise
+the floor itself rather than trust the grant for it, the way `run_test_par.sh`
+does, because that number holds even with no daemon running at all.
+
 A slot that is never released is not leaked. The daemon tracks each client by
 (pid, creation time) and reclaims a dead one's slots within about five seconds,
 so a script killed outright — or one whose failure path calls `exit` — costs the

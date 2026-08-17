@@ -29,7 +29,7 @@ const MODE = process.env.TESTQ || 'on';
 const AUTOSTART = process.env.TESTQ_AUTOSTART !== '0';
 
 /** A no-op slot, so callers never have to branch on whether queueing happened. */
-const UNQUEUED = { queued: false, release() {} };
+const UNQUEUED = { queued: false, boxEngines: 0, release() {} };
 
 /**
  * The same key the Python side computes, and it has to stay the same: `reap`
@@ -181,9 +181,15 @@ export async function acquire(job) {
     return UNQUEUED;
   }
 
-  const lease = () => ({
+  // boxEngines: how many engines this box is committed to carrying while we
+  // run, ours included, as the daemon saw it at the grant. 0 means unknown --
+  // unqueued, or a daemon too old to send it. A caller timing anything against
+  // the wall clock should assert only at 1, and treat 0 as "assert anyway":
+  // infrastructure that silently drops assertions is worse than the flake.
+  const lease = (body) => ({
     queued: true,
     released: false,
+    boxEngines: Number(body?.box_engines ?? body?.lease?.box_engines ?? 0),
     async release(exitCode) {
       if (this.released) return;
       this.released = true;
@@ -191,7 +197,7 @@ export async function acquire(job) {
     },
   });
 
-  if (request.body.granted) return lease();
+  if (request.body.granted) return lease(request.body);
 
   say(
     `the box is busy — queued at position ${request.body.position || '?'} ` +
@@ -211,7 +217,7 @@ export async function acquire(job) {
     const waited = Math.round((Date.now() - startedWaiting) / 1000);
     if (poll.body.granted) {
       say(`got the box after ${waited}s — starting`);
-      return lease();
+      return lease(poll.body);
     }
     if (poll.body.cancelled) {
       warn('cancelled from the testq page before it started');

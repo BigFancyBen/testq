@@ -64,6 +64,11 @@ from urllib.parse import urlparse
 # Bumped when the /acquire body or the grant semantics change. A worktree
 # carrying a newer client than the resident daemon gets a 409 and a printed
 # restart command rather than a subtly wrong grant.
+#
+# A field ADDED to a response is deliberately not a bump: an old client ignores
+# it and a new one has to treat its absence as "unknown" anyway, since the two
+# copies of this file on the box mean either can win the port bind. Bumping for
+# that would 409 every worktree over a field none of them need.
 PROTO = 1
 
 # Outside 27015-27022, which run_shots.sh ui reserves for the port number it
@@ -851,11 +856,38 @@ class Queue(object):
             return "waiting for slots -- %d unmanaged engine(s) on the box" % self.stray
         return "waiting for slots"
 
+    def box_engines(self, ticket):
+        """How many engines this box is committed to carrying while `ticket`
+        runs, its own included.
+
+        This is what a wall-clock assertion inside the run actually needs, and
+        it is not the same question as "did the queue overload the box". A
+        `run_test_par.sh 4` gets the whole box to itself and is still measuring
+        against three sibling shards; mfrs's sound-bank load budget failed at
+        577 ms that way with this number at 4 and nothing else on the machine.
+        The queue was right and the measurement was still worthless. Only the
+        run can decide what to do about that, and it cannot decide without
+        being told.
+
+        Called from activate() before the ticket joins self.leases, so summing
+        the leases counts everybody else exactly once -- including anything
+        granted earlier in the same grant_pass.
+        """
+        others = sum(int(l.get("engines", 1)) for l in self.leases.values())
+        return int(ticket.get("engines", 1)) + others + self.stray
+
     def activate(self, ticket):
         self.queue.remove(ticket)
         ticket["granted_at"] = now()
         ticket["pid_ctime"] = process_ctime(ticket.get("winpid"))
         ticket["observed_max_procs"] = self.observed
+        # Fixed at grant, because that is the only moment the client is
+        # listening -- it exports this into the engine's environment and then
+        # launches. A one-slot job can still be joined afterwards by work the
+        # three free slots allow, so this is a floor and not a promise; the
+        # cases that matter most (a par run booking every slot, an exclusive
+        # one) cannot be joined at all and so are exact.
+        ticket["box_engines"] = self.box_engines(ticket)
         self.leases[ticket["id"]] = ticket
         for key in ticket.get("mutexes", []):
             self.held_mutex[key] = ticket["id"]
@@ -918,6 +950,7 @@ class Queue(object):
                 "eta_s": eta,
                 "blocked_on": "",
                 "observed_max_procs": 0,
+                "box_engines": 0,
             }
             self.queue.append(ticket)
             self.grant_pass()
@@ -1166,6 +1199,10 @@ class Handler(BaseHTTPRequestHandler):
                 "granted": granted,
                 "position": position,
                 "blocked_on": blocked,
+                # Only meaningful when granted is true; a queued ticket has no
+                # grant to describe yet and the client reads it again off the
+                # /wait response that finally grants it.
+                "box_engines": ticket.get("box_engines", 0),
             })
         if path == "/wait":
             job_id = str(body.get("ticket", ""))
