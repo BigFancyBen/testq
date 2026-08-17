@@ -20,10 +20,18 @@
 #   powershell -ExecutionPolicy Bypass -File <testq install>/tray.ps1 [-Port 43117]
 #
 # or, more simply:  python <testq install>/testq.py tray
+#
+# -Auto is how the daemon launches it, and it is the usual way this runs: the
+# icon appears when the box gets busy and takes itself away once the queue has
+# been idle for -IdleExitSeconds, so there is nothing in the notification area
+# on a quiet machine and nothing to remember to start on a busy one. Launched
+# by hand -- `testq.py tray` -- it stays up until it is dismissed.
 
 param(
   [int]$Port = 0,
-  [int]$IntervalSeconds = 4
+  [int]$IntervalSeconds = 4,
+  [switch]$Auto,
+  [int]$IdleExitSeconds = 90
 )
 
 if ($Port -le 0) {
@@ -46,6 +54,9 @@ $script:Base = "http://127.0.0.1:$Port"
 $script:LastIconKey = ""
 $script:LastFinished = 0
 $script:Announced = $true
+# Idle from the moment it starts, so an icon raised onto a box whose one job
+# died in the same second still leaves on schedule instead of sitting there.
+$script:IdleSince = Get-Date
 
 # Icons are drawn rather than shipped, so there is no binary asset to keep in
 # step with anything. 32x32 because that is what the overflow area asks for on
@@ -111,6 +122,22 @@ function Short([string]$s, [int]$n) {
   return $s.Substring(0, $n - 1) + [char]0x2026
 }
 
+# An auto-raised icon exists for the duration of the work and no longer. The
+# linger before it goes matters more than it looks: a run that has just failed
+# leaves a red dot and a balloon, and both want time on screen to be read.
+#
+# A daemon that has gone away counts as idle -- the icon is a view onto a queue,
+# and there is nothing to look at once there is no queue.
+function Update-IdleExit([bool]$busy) {
+  if (-not $Auto) { return }
+  if ($busy) { $script:IdleSince = $null; return }
+  if ($null -eq $script:IdleSince) { $script:IdleSince = Get-Date }
+  if (((Get-Date) - $script:IdleSince).TotalSeconds -ge $IdleExitSeconds) {
+    $notify.Visible = $false
+    [System.Windows.Forms.Application]::Exit()
+  }
+}
+
 function Update-Tray {
   try {
     $state = Invoke-RestMethod -Uri "$script:Base/state" -TimeoutSec 3
@@ -120,6 +147,7 @@ function Update-Tray {
     # written to fit rather than trimmed at the last moment.
     $notify.Text = "testq: daemon not running"
     $script:StatusItem.Text = "daemon not running on port $Port"
+    Update-IdleExit $false
     return
   }
 
@@ -178,6 +206,11 @@ function Update-Tray {
   } else {
     $script:StatusItem.Text = "idle -- $cap cpu, $($state.capacity.gpu) gpu free"
   }
+
+  # Strays are not counted here on purpose, and the daemon does not count them
+  # either: an editor somebody left open is an unmanaged engine for the rest of
+  # the afternoon, and it would pin the icon up for all of it.
+  Update-IdleExit ($running -gt 0 -or $queued -gt 0)
 }
 
 $timer = New-Object System.Windows.Forms.Timer

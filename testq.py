@@ -41,6 +41,8 @@ Subcommands:
   start     snapshot this file to the runtime dir and spawn `serve` detached
   status    one line per running and queued job
   stop      ask the daemon to exit
+  tray      pin the notification-area icon up (the daemon raises it by itself
+            while the box is busy, so this is only for keeping it there)
   reap      delete scratch belonging to worktrees that no longer exist
 """
 
@@ -81,6 +83,13 @@ TASKLIST_CACHE_SECONDS = 5.0
 WAIT_POLL_SECONDS = 25.0          # long-poll ceiling, under any proxy's patience
 TICKET_STALE_SECONDS = 60.0       # a queued client that stopped polling is gone
 HISTORY_KEEP = 200
+
+# The tray icon follows the work: the daemon raises it when the box goes busy
+# and the icon takes itself away once the queue has been idle this long. The
+# linger is the point of the number -- a suite that ends badly has to leave a
+# red dot and its balloon on screen long enough to be read, and vanishing the
+# instant the last slot came back would hide exactly the run worth noticing.
+TRAY_IDLE_LINGER = 90.0
 
 # A job with no estimate sorts as if it were long, so an unknown never jumps a
 # known-short one.
@@ -607,6 +616,10 @@ class Queue(object):
         self.stray = 0
         self.stray_prev = 0
         self.sha = ""
+        self.port = DEFAULT_PORT
+        # Whether the box was busy at the last tick, which is all the tray
+        # needs: the icon is raised on the edge into busy, not held up by us.
+        self.was_busy = False
         self.load_state()
         self.load_history()
 
@@ -717,7 +730,34 @@ class Queue(object):
             if granted:
                 self.save_state()
                 self.changed.notify_all()
-            return granted
+            busy = bool(self.leases or self.queue)
+        # Outside the lock: spawning a process is not something to hold the
+        # scheduler for, and nothing below touches queue state.
+        self.follow_tray(busy)
+        return granted
+
+    def follow_tray(self, busy):
+        """Raise the notification-area icon when the box goes from idle to busy.
+
+        The icon is worth having exactly while something is using the machine,
+        so nobody should have to remember to start it -- any project's first
+        acquire starts the daemon, and the daemon puts the icon up. It takes
+        itself away again after TRAY_IDLE_LINGER of quiet.
+
+        Only on the edge into busy. If you dismiss the icon by hand mid-run,
+        respawning it on the next tick would be arguing with you; it stays
+        dismissed until the queue has gone quiet and come back.
+
+        Strays deliberately do not count as busy. An editor left open all
+        afternoon is an unmanaged engine, and raising a permanent icon for it
+        would make the icon furniture again.
+        """
+        if busy == self.was_busy:
+            return
+        self.was_busy = busy
+        if busy and spawn_tray(self.port):
+            sys.stderr.write("raised the tray icon\n")
+            sys.stderr.flush()
 
     def reap(self):
         dead = []
@@ -1388,6 +1428,72 @@ def origin_hint():
     return "python %s start --restart" % (src or "<your testq install>/testq.py")
 
 
+def tray_script():
+    """Where tray.ps1 is.
+
+    Next to this file when the CLI asks, but the daemon serves from a snapshot
+    in the runtime directory and `start` copies out testq.py alone -- so the
+    daemon has to go back through origin.txt to the install it came from.
+    """
+    beside_self = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tray.ps1")
+    if os.path.exists(beside_self):
+        return beside_self
+    # The daemon's copy, put there by `start` and the one that survives its
+    # install being a worktree that no longer exists.
+    in_runtime = os.path.join(runtime_dir(), "tray.ps1")
+    if os.path.exists(in_runtime):
+        return in_runtime
+    try:
+        with open(origin_path(), "r", encoding="utf-8") as fh:
+            src = fh.read().strip()
+    except Exception:
+        src = ""
+    if src:
+        beside_origin = os.path.join(os.path.dirname(src), "tray.ps1")
+        if os.path.exists(beside_origin):
+            return beside_origin
+    return beside_self
+
+
+def spawn_tray(port, auto=True):
+    """Put the icon in the notification area, detached from whoever asked.
+
+    `auto` is the daemon's: an auto-raised icon leaves again once the queue has
+    been idle for a while. One asked for by hand stays until it is dismissed.
+
+    Two icons on one port cannot happen -- tray.ps1 holds a named mutex and the
+    loser exits immediately -- so a spawn against a tray that is already up
+    costs one short-lived PowerShell and changes nothing.
+    """
+    if not IS_WINDOWS:
+        return False
+    script = tray_script()
+    if not os.path.exists(script):
+        return False
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-WindowStyle", "Hidden", "-File", script, "-Port", str(port)]
+    if auto:
+        cmd += ["-Auto", "-IdleExitSeconds", str(int(TRAY_IDLE_LINGER))]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            # CREATE_NO_WINDOW alone, and the "alone" is the whole point:
+            # DETACHED_PROCESS and CREATE_NO_WINDOW are documented as mutually
+            # exclusive, and when the pair is passed and DETACHED wins,
+            # powershell.exe comes up with no console for its host to sit in and
+            # exits 0 without executing a line of the script. Silently: no
+            # window, no error, no icon, and a spawn that looks like it worked
+            # from here. CREATE_NO_WINDOW gives it a console nobody can see,
+            # which is what was wanted, and the child outlives us either way.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            close_fds=True)
+    except Exception:
+        return False
+    return True
+
+
 def source_sha():
     try:
         with open(os.path.abspath(__file__), "rb") as fh:
@@ -1423,6 +1529,7 @@ def cmd_serve(args):
         sys.stderr.write("imported %d row(s) from the old JSONL history\n" % moved)
     queue = Queue()
     queue.sha = source_sha()
+    queue.port = port
     stopping = threading.Event()
     Handler.queue = queue
     Handler.stopping = stopping
@@ -1509,6 +1616,17 @@ def cmd_start(args):
         fh.write(os.path.basename(snapshot))
     with open(origin_path(), "w", encoding="utf-8") as fh:
         fh.write(os.path.abspath(__file__))
+    # tray.ps1 goes out with it. The daemon raises the icon itself now, and it
+    # is served from the runtime directory precisely because the file it was
+    # started from may be a worktree that gets deleted mid-afternoon -- which
+    # would otherwise cost every later run its icon. Never fatal: no icon is a
+    # worse day than no queue by a wide margin.
+    try:
+        beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tray.ps1")
+        if os.path.exists(beside):
+            shutil.copyfile(beside, os.path.join(runtime_dir(), "tray.ps1"))
+    except Exception as exc:
+        sys.stderr.write("could not copy tray.ps1 to the runtime dir: %r\n" % (exc,))
 
     flags = 0
     if IS_WINDOWS:
@@ -1572,9 +1690,14 @@ def cmd_status(args):
 
 
 def cmd_tray(args):
-    """Put the icon in the notification area, detached from this shell."""
+    """Put the icon in the notification area and keep it there.
+
+    The daemon raises the icon by itself whenever the box is busy, so this is
+    now for pinning it up permanently -- an icon asked for by hand does not
+    take itself away when the queue goes quiet.
+    """
     port = port_from_env(args.port)
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tray.ps1")
+    script = tray_script()
     if not os.path.exists(script):
         print("tray.ps1 is missing next to testq.py")
         return 1
@@ -1594,15 +1717,10 @@ def cmd_tray(args):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         print("tray icon stopped")
         return 0
-    subprocess.Popen(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-         "-WindowStyle", "Hidden", "-File", script, "-Port", str(port)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        creationflags=(getattr(subprocess, "DETACHED_PROCESS", 0)
-                       | getattr(subprocess, "CREATE_NO_WINDOW", 0)),
-        close_fds=True)
-    print("tray icon started -- look in the notification overflow area (^).")
+    if not spawn_tray(port, auto=False):
+        print("could not start the tray icon")
+        return 1
+    print("tray icon pinned -- look in the notification overflow area (^).")
     print("Drag it onto the taskbar to keep it visible.")
     return 0
 

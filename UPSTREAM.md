@@ -41,11 +41,27 @@ snapshot whose `__file__` names neither.
 **`clients/testq.mjs`.** New. A Node client speaking the same protocol as
 `run_lib.sh`'s bash one, because the projects that were not mfrs are Node.
 
+**The tray follows the work.** The daemon raises the icon itself when the box
+goes busy, and an auto-raised icon leaves once the queue has been idle for
+`TRAY_IDLE_LINGER`; `testq.py tray` now means "pin it up permanently". Upstream
+the icon was something you started by hand and left running, which is a fine
+arrangement for a tool that belongs to one project and a poor one here: nobody
+should have to have started anything for the queue to be visible while some
+other project's worktree is using the box. `start` copies `tray.ps1` into the
+runtime directory alongside the snapshot, since the daemon must still find it
+after the install it came from has been deleted.
+
+This also fixes a latent bug inherited from upstream: the tray was spawned with
+`DETACHED_PROCESS | CREATE_NO_WINDOW`, which Windows documents as mutually
+exclusive, and when DETACHED wins `powershell.exe` has no console for its host
+and exits 0 without running a line of the script — no window, no error, no icon.
+`CREATE_NO_WINDOW` alone. Worth carrying back to any vendored copy.
+
 **Comments and docs.** The design notes that said "the suite" or "this box's
-worktrees" now name mfrs where they mean mfrs. `tray.ps1` is unchanged except
-for two usage-comment paths; its global mutex deliberately keeps the
-`mfrs-testq-tray-$Port` name, since preventing two trays is the entire point of
-it and a vendored copy is still out there using that name.
+worktrees" now name mfrs where they mean mfrs. `tray.ps1` keeps the
+`mfrs-testq-tray-$Port` name for its global mutex, since preventing two trays is
+the entire point of it and a vendored copy is still out there using that name —
+which also means an old vendored tray and this one still exclude each other.
 
 ## Collapsing the fork
 
@@ -58,9 +74,9 @@ document is history.
 
 Until it merges nothing is broken either: both copies share the runtime
 directory and the protocol, and whichever daemon is up serves both projects.
-Keep this one running — the tray, or a `shell:startup` shortcut — and mfrs's
-client will never need to spawn its own, because it only autostarts when nothing
-answers on the port.
+Note that an mfrs daemon serving the box is one that does not raise the icon,
+since that half is only in this copy — one more reason to make sure this is the
+one that wins the bind.
 
 **Keep the legacy runtime directory support regardless of #94.** It is not about
 the fork: `%LOCALAPPDATA%\mfrs-testq` is where the accumulated run history

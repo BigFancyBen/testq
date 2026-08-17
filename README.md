@@ -45,7 +45,7 @@ the first time a client asks for it.
     python testq.py status
     python testq.py stats --days 7
     python testq.py stop [--force]
-    python testq.py tray              # icon in the notification area
+    python testq.py tray              # pin the icon up (it appears by itself)
     python testq.py reap              # delete scratch of deleted worktrees
 
 State, the history database and the daemon's own snapshot live in
@@ -57,9 +57,10 @@ medians drawn from it. `TESTQ_HOME` overrides.
 mfrs is losing its vendored copy in its PR #94, which points `run_lib.sh` here.
 Until that merges there are two copies of `testq.py` on the box and either can
 win the port bind — harmless, because they share the runtime directory and the
-protocol. Keep this one running (the tray, or a shortcut in `shell:startup`) and
-mfrs will never spawn its own: its client only autostarts a daemon when nothing
-answers on the port.
+protocol, though only this one raises the tray icon. Keep this one running (a
+shortcut to `testq.py start` in `shell:startup` is enough) and mfrs will never
+spawn its own: its client only autostarts a daemon when nothing answers on the
+port.
 
 ## Using it from a project
 
@@ -171,21 +172,37 @@ reaper that deletes somebody's work.
 
 ## The tray icon
 
-    python testq.py tray        # then look under the ^ in the taskbar
+**There is nothing to start.** The icon appears in the notification area
+whenever the box is busy — any project, any worktree, whether the run was
+started by you or by an agent — and takes itself away again a minute and a half
+after the queue goes quiet. Any project's first `acquire` starts the daemon, and
+the daemon raises the icon.
 
-Puts testq in the notification area and nothing on screen until you ask. Hover
-for a one-line summary, left-click to open the page, right-click for the
+Hover for a one-line summary, left-click to open the page, right-click for the
 running and queued jobs in full. The icon itself is the status: grey idle, blue
 running, amber something waiting, purple engines on the box that the queue did
 not start, red if the last job to finish did not pass — and a balloon when one
-fails.
+fails. The linger after the queue empties is what leaves that red dot and its
+balloon on screen long enough to be read.
 
-Windows 11 files new icons under the overflow chevron by default, which is
-where you asked for it; drag it onto the taskbar to keep it out. To have it
-come back after a reboot, put a shortcut to that command in `shell:startup` —
-which is also how you make sure this install, rather than a project's vendored
-copy, is the daemon that ends up serving.
-`--stop` removes it, as does "Hide this icon" on its menu.
+Windows 11 files new icons under the overflow chevron by default. Drag it onto
+the taskbar to see it without opening the chevron — Windows remembers that
+per-icon, so it holds for the ones raised on later runs too.
+
+Unmanaged engines deliberately do not keep the icon up. An editor left open all
+afternoon is an engine the queue did not start, and pinning a permanent icon on
+that would make it furniture again — it still turns the icon purple while
+something else is running.
+
+    python testq.py tray          # pin it up permanently
+    python testq.py tray --stop   # and take it down again
+
+is there for when you want it up regardless: an icon asked for by hand stays
+until it is dismissed, which is also true of "Hide this icon" on its menu —
+dismiss it mid-run and it stays gone until the queue has gone quiet and come
+back. There is no need for a `shell:startup` shortcut any more, though one is
+still the surest way to make this install, rather than a project's vendored
+copy, the daemon that ends up serving.
 
 It is a PowerShell script (`tray.ps1`) using the tray API Windows already has,
 not an Electron app. Everything the tray needs to do — sit in the overflow
