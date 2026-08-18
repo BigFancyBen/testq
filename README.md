@@ -4,11 +4,16 @@ One queue for every Godot run on this machine, belonging to no project.
 
 ## Why
 
-There is one box, one GPU, and about four engines' worth of real capacity —
-mfrs's `run_test_par.sh` records the measurement: six and eight shards each ran
-1.5–1.7× slower than four and finished later overall. Against that there are
-several projects and a couple of dozen worktrees between them, each of which
-thinks it is alone on the machine.
+There is one box, one GPU, and four slots' worth of admission — a slot being
+"a job's fair share of the machine", not a measured engine ceiling. (An older
+version of this paragraph cited mfrs's finding that six and eight shards ran
+1.5–1.7× slower than four; retaken under the queue on a quiet box, that
+measurement did not survive — eight shards run the same suite 1.6× faster
+than four, and the old slowdown was neighbouring worktrees, which is this
+tool's whole thesis. mfrs's `run_test_par.sh` now oversubscribes its four-slot
+booking with eight engines by design.) Against the four slots there are
+several projects and a couple of dozen worktrees, each of which thinks it is
+alone on the machine.
 
 Two sessions starting `run_test_par.sh 4` in the same minute put eight engines
 on a four-engine box, and everything that asserts against the wall clock starts
