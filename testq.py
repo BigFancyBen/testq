@@ -825,6 +825,10 @@ class Queue(object):
                 waited = now() - ticket["enqueued_at"]
                 quiet = self.stray == 0 or waited > EXCLUSIVE_STRAY_PATIENCE
                 fits = not self.leases and quiet
+            if not fits and self.try_shrink(ticket, blocked_mutex, free_cpu,
+                                            free_gpu):
+                need_cpu, need_gpu = self.need_of(ticket)
+                fits = True
             if fits:
                 self.activate(ticket)
                 granted.append(ticket["id"])
@@ -840,6 +844,67 @@ class Queue(object):
                 reserved_mutexes.update(mutexes)
                 ticket["blocked_on"] = self.explain(ticket, blocked_mutex)
         return granted
+
+    def eta_until_free(self, want_more):
+        """A rough time until `want_more` further cpu slots come free, off the
+        running leases' own estimates, assuming nothing new is granted first.
+        Floored per lease at 15 s: a lease already past its estimate could end
+        any second, but assuming zero would make every shrink decision read
+        "the wait is free" exactly when the estimate has already been wrong.
+        """
+        rel = []
+        for l in self.leases.values():
+            eta = l.get("eta_s")
+            eta = UNKNOWN_ETA if eta is None else float(eta)
+            remaining = max(15.0, eta - (now() - float(l.get("granted_at") or now())))
+            rel.append((remaining, self.need_of(l)[0]))
+        rel.sort()
+        freed = 0
+        for remaining, slots in rel:
+            freed += slots
+            if freed >= want_more:
+                return remaining
+        return float("inf")
+
+    def try_shrink(self, ticket, blocked_mutex, free_cpu, free_gpu):
+        """Grant a flexible job narrower than it asked, when that answers
+        sooner than waiting for the full width.
+
+        The lumpiness problem this solves: a four-slot job cannot start until
+        four slots are free AT ONCE, so behind two long one-slot jobs it sits
+        for minutes while two slots idle. A job that declared `slots_min` is
+        promising its total work is fixed and divides across whatever width it
+        gets (run_test_par: the suite is the suite, shards just split it), so
+        the comparison is closed-form: total work W at width G finishes at
+        W/G; waiting T for the full width N finishes at T + W/N. Shrink only
+        when the first is sooner -- two slots freeing in thirty seconds still
+        beat starting narrow, and this arithmetic is why a shrink never fires
+        in that case.
+
+        The contract for flexible jobs, and why `engines` is rewritten too:
+        a job that sends slots_min is stating its engine count FOLLOWS the
+        granted width (the client reads the granted `slots` off the lease and
+        launches that many). A job whose engine count is fixed must not send
+        slots_min at all.
+        """
+        if blocked_mutex or ticket.get("exclusive"):
+            return False
+        want, want_gpu = self.need_of(ticket)
+        smin = int(ticket.get("slots_min", want))
+        if smin >= want or free_cpu < smin or want_gpu > free_gpu:
+            return False
+        eta = ticket.get("eta_s")
+        if eta is None:
+            return False
+        grant = min(want, free_cpu)
+        work = float(eta) * want
+        wait = self.eta_until_free(want - free_cpu)
+        if work / grant >= wait + work / want:
+            return False
+        ticket["slots"] = grant
+        ticket["engines"] = grant
+        ticket["eta_s"] = round(work / grant, 1)
+        return True
 
     def explain(self, ticket, blocked_mutex):
         if blocked_mutex:
@@ -897,8 +962,19 @@ class Queue(object):
         return {
             "id": job["id"],
             "tree": job.get("tree_id", ""),
+            # Everything the ticket booked has to ride along here, or the
+            # database quietly records a 4-engine par run as costing the same
+            # as a 1-engine serial one. It did, for the first 400 rows: these
+            # five keys were missing, append_history()'s .get() defaults
+            # filled the columns with 0/"" and nobody could compute true
+            # engine-hours from `stats` until it was noticed in a profile.
+            "tree_path": job.get("tree_path", ""),
             "script": job.get("script", ""),
             "arg": job.get("arg", ""),
+            "slots": job.get("slots", 0),
+            "gpu": job.get("gpu", 0),
+            "exclusive": job.get("exclusive", False),
+            "engines": job.get("engines", 1),
             "exit": exit_code,
             "verdict": verdict,
             "dur_s": round(now() - granted, 1) if granted else 0.0,
@@ -929,6 +1005,14 @@ class Queue(object):
             eta = body.get("eta_s")
             if eta is None:
                 eta = self.estimate(script, arg, tree_id, body)
+            slots_val = max(0, int(body.get("slots", 1)))
+            # A flexible job: "slots is what I want, slots_min is what I can
+            # run on". 0 or absent means rigid, which is every job that runs
+            # a fixed number of engines. Only a job whose engine count follows
+            # the width it is granted (run_test_par picks its shard count off
+            # the grant) should send this -- see try_shrink for the contract.
+            smin = int(body.get("slots_min", 0) or 0)
+            smin = slots_val if smin <= 0 else min(smin, slots_val)
             ticket = {
                 "id": self.next_id("J"),
                 "project": str(body.get("project", "")),
@@ -937,7 +1021,8 @@ class Queue(object):
                 "script": script,
                 "arg": arg,
                 "cmdline": str(body.get("cmdline", "")),
-                "slots": max(0, int(body.get("slots", 1))),
+                "slots": slots_val,
+                "slots_min": smin,
                 "gpu": max(0, int(body.get("gpu", 0))),
                 "exclusive": bool(body.get("exclusive", False)),
                 "engines": max(1, int(body.get("engines", 1))),
@@ -1203,6 +1288,9 @@ class Handler(BaseHTTPRequestHandler):
                 # grant to describe yet and the client reads it again off the
                 # /wait response that finally grants it.
                 "box_engines": ticket.get("box_engines", 0),
+                # The width actually granted, which for a flexible job can be
+                # less than it asked (see try_shrink). Same caveat as above.
+                "slots": ticket.get("slots", 0),
             })
         if path == "/wait":
             job_id = str(body.get("ticket", ""))
@@ -1776,15 +1864,21 @@ def cmd_stats(args):
         params.append("%" + args.tree + "%")
 
     with db() as conn:
+        # Engine-hours weight each run by how many engines it booked; rows
+        # from before the history writer carried `engines` (or imported from
+        # the legacy JSONL) hold 0 there, so they count as one engine, which
+        # is what most of them were.
         total = conn.execute(
-            "SELECT COUNT(*) n, SUM(dur_s) ran, SUM(queued_s) waited"
+            "SELECT COUNT(*) n, SUM(dur_s) ran, SUM(queued_s) waited,"
+            "       SUM(dur_s * MAX(COALESCE(engines, 1), 1)) eng"
             " FROM runs WHERE " + where, params).fetchone()
         if not total["n"]:
             print("no runs recorded in the last %d day(s)" % args.days)
             return 0
-        print("last %d day(s): %d run(s), %.1f h of engine time, %.1f h spent queueing"
+        print("last %d day(s): %d run(s), %.1f h of box time, %.1f engine-hours,"
+              " %.1f h spent queueing"
               % (args.days, total["n"], (total["ran"] or 0) / 3600.0,
-                 (total["waited"] or 0) / 3600.0))
+                 (total["eng"] or 0) / 3600.0, (total["waited"] or 0) / 3600.0))
 
         print("\nby job:")
         print("  %-22s %5s %7s %7s %7s  %s"
@@ -1811,10 +1905,12 @@ def cmd_stats(args):
 
         print("\nby worktree:")
         rows = conn.execute(
-            "SELECT tree, COUNT(*) n, SUM(dur_s) ran, SUM(queued_s) waited,"
+            "SELECT tree, COUNT(*) n,"
+            "       SUM(dur_s * MAX(COALESCE(engines, 1), 1)) ran,"
+            "       SUM(queued_s) waited,"
             "       MAX(observed_max_procs) peak"
             " FROM runs WHERE " + where +
-            " GROUP BY tree ORDER BY SUM(dur_s) DESC LIMIT ?",
+            " GROUP BY tree ORDER BY ran DESC LIMIT ?",
             params + [args.limit]).fetchall()
         for r in rows:
             print("  %-38s %4d run(s)  %8s engine time  %8s queued  peak %d engine(s)"
@@ -1824,17 +1920,26 @@ def cmd_stats(args):
         # A job that fails sometimes and passes other times is the expensive
         # kind of problem here, so it gets called out by name rather than left
         # for someone to notice in the pass/fail columns above.
+        #
+        # Within ONE worktree, though. Aggregated across trees this cried
+        # wolf: every worktree here is a branch mid-development, so a job red
+        # thirteen times in the branch that broke it and green everywhere else
+        # is development doing its job, not flake. (A row this table once
+        # showed "failing 42% of the time" was byte-for-byte deterministic at
+        # HEAD -- every one of its failures belonged to two feature branches.)
+        # A job that flips within a single checkout has no such excuse.
         rows = conn.execute(
-            "SELECT script, arg, COUNT(*) n,"
+            "SELECT script, arg, tree, COUNT(*) n,"
             "       SUM(CASE WHEN exit=0 THEN 1 ELSE 0 END) ok"
             " FROM runs WHERE " + where + " AND verdict='released'"
-            " GROUP BY script, arg HAVING ok > 0 AND ok < n", params).fetchall()
+            " GROUP BY script, arg, tree HAVING ok > 0 AND ok < n",
+            params).fetchall()
         if rows:
-            print("\nsometimes passing, sometimes not:")
+            print("\nsometimes passing, sometimes not, in one worktree:")
             for r in rows:
-                print("  %-22s %d of %d passed"
+                print("  %-22s %-30s %d of %d passed"
                       % (("%s %s" % (r["script"], r["arg"] or "")).strip()[:22],
-                         r["ok"], r["n"]))
+                         (r["tree"] or "?")[:30], r["ok"], r["n"]))
     return 0
 
 

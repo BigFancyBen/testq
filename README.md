@@ -259,7 +259,7 @@ semaphore of size one would deadlock both on the first call.
 | Job | CPU | GPU | Engines | Notes |
 |---|---|---|---|---|
 | mfrs `run_test.sh` | 1 | – | 1 | |
-| mfrs `run_test_par.sh N` | min(N,4) | – | N | asking for more than four is already documented as net-worse |
+| mfrs `run_test_par.sh N` | 2–min(N,4), flexible | – | = granted width | see "Flexible width" below |
 | mfrs `run_mp.sh` | **all** | **all** | 2 | exclusive: its verdict is only meaningful on a quiet box |
 | mfrs `run_shots.sh` | 1 | 1 | 1 | windowed; `ui` also takes the `ports:27015` mutex |
 | mfrs `run_clip.sh` | 1 | 1 | 1 | takes `clip:<tree>:<scenario>`, closing the same-scenario frame-dir race |
@@ -273,6 +273,25 @@ eleven-minute suites. Nothing starves: a job that has waited longer than
 `max(600 s, 2× its own estimate)` ages to the front, and while a large job is
 at the head its unmet slots are reserved so a stream of small ones cannot keep
 it out. A job blocked only on the GPU still lets CPU-only work past it.
+
+### Flexible width
+
+A multi-slot job used to be lumpy: four slots have to be free *at once*, so a
+parallel suite behind two long one-slot jobs sat waiting while two slots
+idled. A job may now send `slots_min` alongside `slots` — "this is what I
+want, this is what I can run on" — and the daemon will grant anything between
+when starting narrow answers sooner than waiting for the full width. The
+comparison is closed-form, because a flexible job is promising its total work
+is fixed and divides across whatever width it gets: work `W` at granted width
+`G` finishes at `W/G`; waiting `T` for the full `N` finishes at `T + W/N`.
+Two slots freeing in thirty seconds still beat starting narrow, and the
+arithmetic is why no shrink fires in that case.
+
+The contract: a flexible job's **engine count follows the granted width**.
+The client reads the width back (`$TESTQ_SLOTS` in bash, `slot.slots` in
+Node) and launches exactly that many engines — `run_test_par.sh` picks its
+shard count off the grant. A job whose engine count is fixed must never send
+`slots_min`.
 
 ## Design notes worth knowing
 
