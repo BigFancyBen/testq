@@ -4,7 +4,8 @@ One queue for every Godot run on this machine, belonging to no project.
 
 ## Why
 
-There is one box, one GPU, and eight slots' worth of admission — a slot being
+There is one box, one GPU that takes two windows at a time, and eight slots'
+worth of admission — a slot being
 "a job's fair share of the machine", not a measured engine ceiling. (It was
 four, on mfrs's finding that six and eight shards ran 1.5–1.7× slower than
 four; retaken under the queue on a quiet box, that measurement did not
@@ -310,10 +311,11 @@ semaphore of size one would deadlock both on the first call.
 | Job | CPU | GPU | Engines | Notes |
 |---|---|---|---|---|
 | mfrs `run_test.sh` | 1 | – | 1 | |
-| mfrs `run_test_par.sh N` | 2–min(N,4), flexible | – | = granted width | see "Flexible width" below |
+| mfrs `run_test_par.sh N` | 2–min(N,8), flexible | – | = granted width | see "Flexible width" below |
 | mfrs `run_mp.sh` | **all** | **all** | 2 | exclusive: its verdict is only meaningful on a quiet box |
 | mfrs `run_shots.sh` | 1 | 1 | 1 | windowed; `ui` also takes the `ports:27015` mutex |
 | mfrs `run_clip.sh` | 1 | 1 | 1 | takes `clip:<tree>:<scenario>`, closing the same-scenario frame-dir race |
+| mfrs `run_perf.sh` | 1 | **all** | 1 | frame times it means to quote: no second window on the card |
 | mfrs `run_attach.sh` | – | – | – | no engine, never queued |
 | prognosticator `capture-warehouse.mjs` | 1 | 1 | 1 | windowed; releases when the engine exits, not when ffmpeg does |
 | prognosticator `godot-export-web.js` | 1 | – | 1 | two headless passes, one after the other |
@@ -377,6 +379,18 @@ again on the first reading that shows it working. Twenty-three headless probes
 that finished their scripts and never exited once docked every slot on the box
 and held their own session's queued jobs for sixteen minutes. The daemon does
 not kill them — they are not its to kill — it only stops waiting for them.
+
+**Two windows share the card, and a measurement books both.** GPU capacity was
+one, and it was the worst line on the box: over a week GPU jobs ran for 17
+hours and queued for 44, 34 of those behind another window. The card itself
+was a quarter busy with three windowed engines up; what a window costs is
+about 1.6 GB of its 12, which is why the number is two and not three. A shot
+or a fixed-fps clip does not care who else is drawing. A job that does —
+`run_perf.sh`, anything quoting a frame time — sends `gpu` equal to the
+capacity in `/state`, and an ask for more than there is is clamped to all of
+it. Prognosticator's live captures (`capture-warehouse.mjs`, `runLiveEngine`)
+record against a wall-clock beat feed and book one: a second window can cost
+them recorder frame rate, which they report and assemble at, not correctness.
 
 **Leader election is the port bind**, with `SO_EXCLUSIVEADDRUSE` set before
 bind. There is no lock file to go stale, and a second daemon exits quietly.

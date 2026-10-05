@@ -194,6 +194,8 @@ async function startDaemon() {
  * @param {string} [job.treePath] the checkout this runs in (default: cwd)
  * @param {number} [job.slots]   CPU slots, of eight on this box
  * @param {number} [job.gpu]     1 if it opens a window
+ *   (two fit at once); the `capacity.gpu` in /state, or anything above it, for
+ *   the card to itself — a frame time you mean to quote
  * @param {number} [job.engines] engines alive at once
  * @param {boolean} [job.exclusive] wants a quiet box (timing measurements)
  * @param {string[]} [job.mutexes]  named exclusions, e.g. ['ports:27015']

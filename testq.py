@@ -83,10 +83,17 @@ DEFAULT_PORT = 43117
 # did not survive: eight shards ran the mfrs suite 1.6x faster than four
 # (152 s -> 94 s), and the old slowdown was other worktrees' engines. The box
 # is 16 cores and 24 threads.
-CAPACITY = {"cpu": 8, "gpu": 1}
+CAPACITY = {"cpu": 8, "gpu": 2}
 
-# One GPU, and the windowed harnesses (run_shots, run_clip) are the only things
-# that want it.
+# One card, two windows on it at once. It was one, and that was the queue's
+# worst line: in a week, GPU jobs ran for 17 hours and queued for 44, 34 of
+# them behind another window -- 14 behind their own worktree's. The card was
+# never the constraint. Three windowed engines leave an RTX 3080 at a quarter
+# busy; what they cost is memory, about 1.6 GB each of 12, on a desktop that
+# already holds several. So two, not three. A job whose numbers need the card
+# to itself books both (run_perf does); an ask for more than there is means
+# all of it.
+
 TICK_SECONDS = 5.0
 TASKLIST_CACHE_SECONDS = 5.0
 WAIT_POLL_SECONDS = 25.0          # long-poll ceiling, under any proxy's patience
@@ -1577,7 +1584,7 @@ class Queue(object):
             return "waiting for a quiet box"
         if int(ticket.get("gpu", 0)) > 0:
             used_gpu = sum(self.need_of(l)[1] for l in self.leases.values())
-            if used_gpu >= self.capacity["gpu"]:
+            if used_gpu + int(ticket.get("gpu", 0)) > self.capacity["gpu"]:
                 return "waiting for the GPU"
         if self.stray:
             return "waiting for slots -- %d unmanaged engine(s) on the box" % self.stray
@@ -1694,7 +1701,7 @@ class Queue(object):
                 "cmdline": str(body.get("cmdline", "")),
                 "slots": slots_val,
                 "slots_min": smin,
-                "gpu": max(0, int(body.get("gpu", 0))),
+                "gpu": min(max(0, int(body.get("gpu", 0))), self.capacity["gpu"]),
                 "exclusive": bool(body.get("exclusive", False)),
                 "engines": max(1, int(body.get("engines", 1))),
                 "mutexes": [str(m) for m in body.get("mutexes", []) if str(m)],

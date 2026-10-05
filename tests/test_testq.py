@@ -75,7 +75,11 @@ class Box(unittest.TestCase):
             os.remove(testq.state_path())
         except OSError:
             pass
-        self.q = testq.Queue()
+        # One GPU, whatever the real box has: nearly every test here makes a
+        # line by putting a second window behind a first. TwoGpus has the rest.
+        self.q = testq.Queue(dict(testq.CAPACITY, gpu=self.GPUS))
+
+    GPUS = 1
 
     # -- building the box ---------------------------------------------------
 
@@ -528,6 +532,37 @@ class Scheduling(Box):
         self.run_for(5)
         self.assertEqual(self.verdict(first), "reclaimed")
         self.assertTrue(self.running(second))
+
+
+class TwoGpus(Box):
+    GPUS = 2
+
+    def test_two_windows_at_once_and_a_third_waits(self):
+        first = self.job(winpid=100)
+        second = self.job(script="b.mjs", winpid=200)
+        third = self.job(script="c.mjs", winpid=300)
+        self.assertTrue(self.running(first) and self.running(second))
+        self.assertFalse(self.running(third))
+        self.assertEqual(third["blocked_on"], "waiting for the GPU")
+        self.q.release(first["id"], 0)
+        self.assertTrue(self.running(third))
+
+    def test_a_job_that_books_both_waits_for_both(self):
+        clip = self.job(winpid=100)
+        perf = self.job(script="run_perf.sh", winpid=200, gpu=2)
+        late = self.job(script="c.mjs", winpid=300)
+        self.assertFalse(self.running(perf))
+        self.assertEqual(perf["blocked_on"], "waiting for the GPU")
+        # The free half is held for the job at the head of the line.
+        self.assertFalse(self.running(late))
+        self.q.release(clip["id"], 0)
+        self.assertTrue(self.running(perf))
+        self.assertFalse(self.running(late))
+
+    def test_asking_for_more_gpu_than_there_is_means_all_of_it(self):
+        perf = self.job(script="run_perf.sh", winpid=100, gpu=99)
+        self.assertTrue(self.running(perf))
+        self.assertEqual(perf["gpu"], 2)
 
 
 class Parked(Box):
