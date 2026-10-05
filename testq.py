@@ -44,6 +44,8 @@ Subcommands:
   tray      pin the notification-area icon up (the daemon raises it by itself
             while the box is busy, so this is only for keeping it there)
   reap      delete scratch belonging to worktrees that no longer exist
+
+Tests: `python -m unittest discover tests`. They start nothing.
 """
 
 import ctypes
@@ -109,6 +111,45 @@ AGE_FLOOR_SECONDS = 600.0
 # run_mp's own INCONCLUSIVE verdict is exactly the right thing to report if the
 # timing then trips, and it is better than never running the check at all.
 EXCLUSIVE_STRAY_PATIENCE = 300.0
+
+# A run whose engine finished its work and then never exited keeps its lease
+# for as long as its shell lives, and reap() only ever looks at the shell. A
+# 48-second capture held the GPU for two hours that way, with three jobs
+# polling behind it and five more giving up.
+#
+# Being late is not the test. The history has honest runs at fifty times their
+# estimate -- the estimate is keyed on script and arg, and a capture's arg does
+# not say how many seconds it was asked to record. So lateness only makes a
+# lease a suspect: past max(floor, factor x its estimate), or the flat ceiling
+# when there is no estimate. What convicts it is its processes doing nothing --
+# the same set of pids burning under half a core between them for this long. A
+# hung windowed engine idles at about a fifth of a core; a working one does not
+# get under one.
+STALL_FLOOR_SECONDS = 600.0
+STALL_ETA_FACTOR = 3.0
+STALL_UNKNOWN_SECONDS = 1800.0
+STALL_SAMPLE_SECONDS = 60.0       # a process table costs a second of PowerShell
+STALL_QUIET_SECONDS = 300.0
+STALL_IDLE_CORES = 0.5
+
+# Idle is not the only way to hang. A run spinning in a loop burns a core and
+# looks like work for ever; two leases have held their slots for 3.5 and 1.9
+# hours that way before their shells died. So there is also a flat ceiling,
+# and it is deliberately far out: the longest honest run in three thousand is
+# twenty minutes. A client that knows better says so with `max_s`.
+CEILING_SECONDS = 3600.0
+CEILING_ETA_FACTOR = 4.0
+
+# A queued client that dies loses its ticket within a minute, and its retry
+# used to start again at the back -- which is how a session whose command timed
+# out after ten minutes in the queue came to wait twenty, or gave up and ran
+# outside it. The same job from the same worktree inside this window gets its
+# waiting time back.
+PARK_SECONDS = 900.0
+
+# What a job that was killed here is told the next time its worktree asks for
+# anything, for this long. The kill itself cannot say: its reader is dead.
+NOTE_SECONDS = 1800.0
 
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -232,6 +273,9 @@ CREATE INDEX IF NOT EXISTS runs_finished ON runs (finished);
 """
 
 
+MIGRATED = []
+
+
 class db(object):
     """`with db() as conn:` -- an open, initialised, committing connection."""
 
@@ -241,6 +285,15 @@ class db(object):
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        if not MIGRATED:
+            # Added after the table had three thousand rows in it. The other
+            # copy of this file on the box names its columns when it inserts,
+            # so it neither sees this one nor minds it.
+            try:
+                self.conn.execute("ALTER TABLE runs ADD COLUMN size REAL")
+            except sqlite3.OperationalError:
+                pass
+            MIGRATED.append(True)
         return self.conn
 
     def __exit__(self, *exc):
@@ -371,35 +424,130 @@ def process_alive(pid, ctime):
     return current == ctime
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+_WINAPI = []
+
+
+def winapi():
+    """(kernel32, ntdll) with prototypes declared. Handles and addresses are
+    pointer-sized, and ctypes' default of a C int truncates both."""
+    if not _WINAPI:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+        void_p, ulong = ctypes.c_void_p, ctypes.c_ulong
+        k32.OpenProcess.restype = void_p
+        k32.OpenProcess.argtypes = [ulong, ctypes.c_int, ulong]
+        k32.CloseHandle.argtypes = [void_p]
+        k32.ReadProcessMemory.argtypes = [void_p, void_p, void_p,
+                                          ctypes.c_size_t, void_p]
+        k32.GetProcessTimes.argtypes = [void_p] * 5
+        k32.CreateToolhelp32Snapshot.restype = void_p
+        k32.CreateToolhelp32Snapshot.argtypes = [ulong, ulong]
+        k32.Process32FirstW.argtypes = [void_p, void_p]
+        k32.Process32NextW.argtypes = [void_p, void_p]
+        ntdll.NtQueryInformationProcess.argtypes = [
+            void_p, ctypes.c_int, void_p, ulong, void_p]
+        _WINAPI.extend([k32, ntdll])
+    return _WINAPI[0], _WINAPI[1]
+
+
+def process_times(pid):
+    """(cpu seconds so far, creation time) of a live process; zeros for one
+    that will not open, which is the system's own and nothing we weigh."""
+    k32, _ = winapi()
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return 0.0, 0
+    try:
+        created, exited, kernel, user = (ctypes.c_ulonglong() for _ in range(4))
+        if not k32.GetProcessTimes(handle, ctypes.byref(created),
+                                   ctypes.byref(exited), ctypes.byref(kernel),
+                                   ctypes.byref(user)):
+            return 0.0, 0
+        # Both in 100 ns units.
+        return (kernel.value + user.value) / 1e7, int(created.value)
+    finally:
+        k32.CloseHandle(handle)
+
+
 def process_table():
-    """pid -> (parent pid, image name, command line) for everything on the box."""
+    """pid -> (parent pid, image name, command line, cpu seconds so far) for
+    everything on the box. {} if the box will not say.
+
+    The command line is only filled in for engines. It is the one field that
+    has to be read out of the process's own memory, nothing here looks at any
+    other process's, and six hundred of those reads a tick would be the most
+    expensive thing the daemon does.
+
+    Straight from the kernel, not through WMI. This used to be PowerShell and
+    Get-CimInstance, and tasklist for the engine count -- a second apiece, and
+    on a loaded box WMI answers "Call cancelled" for minutes at a time. For
+    those minutes the daemon counted no engines on a box carrying eight, which
+    is the wrong direction to be wrong in: it is what tells run_mp the box is
+    quiet.
+
+    A parent pid is only a number, and Windows hands numbers out again. A
+    process older than its "parent" was not started by it; that link is cut
+    here so that no walk down from a shell collects a stranger.
+    """
     if not IS_WINDOWS:
         return {}
-    script = ("Get-CimInstance Win32_Process | "
-              "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
-              "ConvertTo-Json -Compress")
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True, text=True, timeout=30,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ).stdout
-        rows = json.loads(out)
+        k32, _ = winapi()
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)       # TH32CS_SNAPPROCESS
+        if not snap or snap == ctypes.c_void_p(-1).value:
+            return {}
+        rows = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            more = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while more:
+                rows.append((int(entry.th32ProcessID),
+                             int(entry.th32ParentProcessID), entry.szExeFile))
+                more = k32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+        table, born = {}, {}
+        for pid, ppid, name in rows:
+            cpu, born[pid] = process_times(pid)
+            cmdline = ""
+            if GODOT_MATCH in name.lower():
+                cmdline = peb_string(pid, PEB_COMMAND_LINE)
+            table[pid] = (ppid, name, cmdline, cpu)
+        for pid, (ppid, name, cmdline, cpu) in list(table.items()):
+            if born.get(ppid) and born[pid] and born[ppid] > born[pid]:
+                table[pid] = (0, name, cmdline, cpu)
+        return table
     except Exception:
         return {}
-    if isinstance(rows, dict):
-        rows = [rows]
-    table = {}
-    for row in rows:
-        try:
-            table[int(row["ProcessId"])] = (
-                int(row.get("ParentProcessId") or 0),
-                row.get("Name") or "",
-                row.get("CommandLine") or "",
-            )
-        except (TypeError, ValueError, KeyError):
-            continue
-    return table
+
+
+def subtree(table, root):
+    """`root` and everything under it in `table`, parents before children."""
+    found = [root]
+    frontier = [root]
+    while frontier:
+        parent = frontier.pop()
+        for child, row in table.items():
+            if row[0] == parent and child not in found:
+                found.append(child)
+                frontier.append(child)
+    return found
 
 
 def taskkill(pid):
@@ -415,27 +563,146 @@ def taskkill(pid):
         return False
 
 
-def kill_job(pid, tree_path=""):
+def norm_path(path):
+    """One spelling for a path the shell writes /c/Users/..., the engine
+    reports C:\\Users\\... and a client sends C:/Users/..."""
+    path = (path or "").strip().strip('"').replace("\\", "/").lower()
+    if re.match(r"^/[a-z]/", path):
+        path = path[1] + ":" + path[2:]
+    return path.rstrip("/")
+
+
+# Offsets into RTL_USER_PROCESS_PARAMETERS of two UNICODE_STRINGs -- a byte
+# length, padding, and a pointer to the text. The 64-bit layout, which has not
+# moved since Vista.
+PEB_CURRENT_DIRECTORY = 0x38
+PEB_COMMAND_LINE = 0x70
+
+
+def peb_string(pid, offset):
+    """One of a live process's startup strings, or "" if it will not say.
+
+    Read out of the process's own memory, because nothing politer exists: no
+    Windows API reports another process's directory at all, and the only one
+    that reports its command line is WMI (see process_table for why not). Any
+    failure is "" -- an engine with no readable command line or directory is
+    one nobody can place, and callers already have to cope with those.
+    """
+    if not IS_WINDOWS:
+        return ""
+    try:
+        k32, ntdll = winapi()
+        # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+        handle = k32.OpenProcess(0x0410, False, int(pid))
+    except Exception:
+        return ""
+    if not handle:
+        return ""
+    try:
+        def read(address, size):
+            buf = ctypes.create_string_buffer(size)
+            if not address or not k32.ReadProcessMemory(handle, address, buf,
+                                                        size, None):
+                raise OSError("unreadable")
+            return buf.raw
+
+        def pointer(address):
+            return int.from_bytes(read(address, 8), "little")
+
+        # PROCESS_BASIC_INFORMATION: the PEB's address is its second pointer.
+        info = (ctypes.c_void_p * 6)()
+        if ntdll.NtQueryInformationProcess(handle, 0, info,
+                                           ctypes.sizeof(info), None):
+            return ""
+        params = pointer(int(info[1] or 0) + 0x20)     # PEB.ProcessParameters
+        length = int.from_bytes(read(params + offset, 2), "little")
+        if not length:
+            return ""
+        text = read(pointer(params + offset + 8), length)
+        return text.decode("utf-16-le", "replace")
+    except Exception:
+        return ""
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_cwd(pid):
+    return peb_string(pid, PEB_CURRENT_DIRECTORY)
+
+
+ENGINE_PATH = re.compile(r'--path[ =]+(?:"([^"]+)"|(\S+))')
+
+
+def engine_in_tree(cmdline, tree_path, cwd=""):
+    """Whether the engine with this command line is running out of the
+    worktree at `tree_path`: True, False, or None when it cannot be told.
+
+    Worktrees nest. Every mfrs worktree lives under the main checkout, at
+    mfrs/.claude/worktrees/<name>, so "the engine's project is under this
+    directory" is true of the main checkout for every engine in every one of
+    them -- and the leaf name, which is all this used to compare, is worse
+    still. An engine below a `worktrees` directory inside the tree belongs to
+    that inner worktree and not to this one.
+
+    None is an engine started with a relative `--path`, or none, when `cwd`
+    is not there to resolve it against: it is in somebody's worktree and its
+    command line does not say whose. So is every engine, to a job whose client
+    never said which worktree it runs in. Callers have to pick a side for
+    those, and they do not pick the same one.
+    """
+    found = ENGINE_PATH.search(cmdline or "")
+    project = norm_path(found.group(1) or found.group(2)) if found else ""
+    if cwd and not re.match(r"^[a-z]:/", project):
+        # Not joined to the relative path: Godot changes directory into its
+        # project as it starts, so `cwd` already is the project -- or, for the
+        # first instant, the directory it was launched from. Both are inside
+        # the worktree, which is all that is being asked.
+        project = norm_path(cwd)
+    tree = norm_path(tree_path)
+    if not tree or not re.match(r"^[a-z]:/", project):
+        return None
+    if project == tree:
+        return True
+    if not project.startswith(tree + "/"):
+        return False
+    return "/worktrees/" not in project[len(tree):] + "/"
+
+
+def engine_of(pid, cmdline, tree_path):
+    """engine_in_tree for a live engine, asking the process where it is when
+    its command line alone does not say. prognosticator's harnesses all start
+    theirs with `--path godot`."""
+    placed = engine_in_tree(cmdline, tree_path)
+    if placed is None and tree_path:
+        placed = engine_in_tree(cmdline, tree_path, process_cwd(pid))
+    return placed
+
+
+def kill_job(pid, tree_path="", spare=()):
     """Stop a run: its shell, everything under it, and its engines.
 
     `taskkill /F /T` is not enough on its own, and this was worth finding out
     the hard way -- killing a run's bash left `timeout.exe` and both Godot
     engines alive and still grinding through `--test=all` twenty minutes later.
-    Once the shell dies the parent chain to the engines is broken, so a
-    descendant walk from the shell finds nothing either.
+    Git-Bash's `timeout` has no living Windows parent even while the shell is
+    up, so a descendant walk from the shell never reaches a bash client's
+    engines at all.
 
     So there are two passes. The first walks the real parent links and kills
-    the subtree, which is precise and catches everything while the chain is
-    intact. The second sweeps up engines that are already orphaned, matched on
-    the worktree directory in their `--path` argument -- the leaf name, because
-    the shell writes it /c/Users/... and the engine reports it C:/Users/... and
-    only the leaf is spelled the same in both.
+    the subtree, which is precise and is the whole run for a Node client. The
+    second sweeps up the engines the walk cannot reach, matched on the worktree
+    in their `--path` argument -- see engine_in_tree for what "in" has to mean
+    when worktrees nest.
 
     The sweep tests the IMAGE NAME for Godot and the COMMAND LINE for the
     worktree, and needs both. Testing the command line for Godot instead looks
     equivalent and is not: it also matches every shell whose command line
     happens to mention the engine, which on this box includes the editor's own
     terminals. An early version of this would have killed them.
+
+    `spare` is the shells of the other running jobs. One worktree can hold two
+    leases -- a suite and a clip -- and the sweep cannot tell their engines
+    apart by path, so whatever is under another lease's shell is left alone.
 
     Never a blanket kill by image name, either -- that is how one session's
     cleanup has taken down every other worktree's tests on this box before.
@@ -451,8 +718,6 @@ def kill_job(pid, tree_path=""):
         root = int(pid)
     except (TypeError, ValueError):
         root = 0
-    leaf = os.path.basename((tree_path or "").rstrip("/\\")).lower()
-
     # Several passes, because one is provably not enough. Git-Bash's `timeout`
     # nests a second copy of itself between the shell and the engine, the
     # console build of Godot launches the real one as a child of its own, and
@@ -465,22 +730,19 @@ def kill_job(pid, tree_path=""):
         table = process_table()
         victims = []
         if root and root in table:
-            victims.append(root)
-            frontier = [root]
-            while frontier:
-                parent = frontier.pop()
-                for child, (ppid, _, _) in table.items():
-                    if ppid == parent and child not in victims:
-                        victims.append(child)
-                        frontier.append(child)
+            victims.extend(subtree(table, root))
         elif root and attempt == 0:
             victims.append(root)
 
-        if leaf:
-            for candidate, (_, name, cmdline) in table.items():
-                if candidate in victims:
+        if tree_path:
+            spared = set()
+            for other in spare:
+                spared.update(subtree(table, other))
+            for candidate, (_, name, cmdline, _) in table.items():
+                if candidate in victims or candidate in spared:
                     continue
-                if GODOT_MATCH in name.lower() and leaf in cmdline.lower():
+                if (GODOT_MATCH in name.lower()
+                        and engine_of(candidate, cmdline, tree_path)):
                     victims.append(candidate)
 
         if not victims:
@@ -489,14 +751,14 @@ def kill_job(pid, tree_path=""):
         # start another one.
         for victim in reversed(victims):
             taskkill(victim)
-            killed.append("%d:%s" % (victim, table.get(victim, (0, "?", ""))[1]))
+            killed.append("%d:%s" % (victim, table.get(victim, (0, "?", "", 0.0))[1]))
         time.sleep(1.0)
 
     # Logged because a cancel that silently fails to stop the engines is the
     # worst outcome here: the slots come back, the page says the job is gone,
     # and the box is still busy. daemon.log is where that shows up.
     sys.stderr.write("kill_job(pid=%s, tree=%s): killed %s\n"
-                     % (pid, leaf or "?", ", ".join(killed) or "nothing"))
+                     % (pid, tree_path or "?", ", ".join(killed) or "nothing"))
     sys.stderr.flush()
     return len(killed)
 
@@ -527,25 +789,30 @@ GODOT_MATCH = os.environ.get("TESTQ_GODOT_MATCH", "godot_v4").lower()
 GODOT_EXCLUDE = "_console"
 
 
-def count_godot():
-    if not IS_WINDOWS:
-        return 0
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            timeout=20,
-        ).stdout
-    except Exception:
-        return 0
-    n = 0
-    for line in out.splitlines():
-        head = line.split(",", 1)[0].strip().strip('"').lower()
-        if GODOT_MATCH in head and GODOT_EXCLUDE not in head:
-            n += 1
-    return n
+def is_engine(name):
+    name = name.lower()
+    return GODOT_MATCH in name and GODOT_EXCLUDE not in name
+
+
+def count_godot(table=None):
+    """Engines on the box, or None when the box would not say -- which is not
+    the same as none, and the caller must not treat it as none."""
+    if table is None:
+        table = process_table()
+    if not table:
+        return None
+    return sum(1 for row in table.values() if is_engine(row[1]))
+
+
+def tree_label(path):
+    """A project path as short as it can be and still say whose it is:
+    `mfrs/weekend-features` for a worktree, the last two directories for
+    anything else."""
+    path = norm_path(path)
+    nested = re.search(r"/([^/]+)/(?:[^/]+/)?worktrees/([^/]+)", path)
+    if nested:
+        return nested.group(1) + "/" + nested.group(2)
+    return "/".join(path.split("/")[-2:])
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +865,27 @@ def suite_eta(tree_id, which, shards=1, project=""):
     return round(seconds, 1)
 
 
+SIZED_ARG = re.compile(r"^(\d+(?:\.\d+)?)\s+(\S.*)$")
+
+
+def arg_size(arg, size=None):
+    """(kind, size) for a job: what it is doing and how much of it.
+
+    A client that knows says so in `size` and the arg is the kind. One that
+    does not may still have written it into the arg -- "148 scenarios" -- and
+    then the number is the size and the rest is the kind.
+    """
+    try:
+        if size is not None and float(size) > 0:
+            return arg or "", float(size)
+    except (TypeError, ValueError):
+        pass
+    found = SIZED_ARG.match(arg or "")
+    if found:
+        return found.group(2), float(found.group(1))
+    return arg or "", None
+
+
 # ---------------------------------------------------------------------------
 # The queue itself
 # ---------------------------------------------------------------------------
@@ -614,6 +902,17 @@ class Queue(object):
         # Ids cancelled from the UI, so a client long-polling for one is told
         # to give up rather than quietly re-queueing itself.
         self.cancelled = set()
+        # lease id -> the last cpu reading of its processes, for rescue_stalled.
+        # Not on the lease itself: leases are saved, and a reading from before
+        # a restart says nothing about the minute just gone.
+        self.stall_samples = {}
+        # (tree, script, arg) -> (enqueued_at, abandoned_at) of a ticket whose
+        # client went away, so a retry can pick its wait back up.
+        self.parked = {}
+        # tree id -> (text, at): see NOTE_SECONDS.
+        self.notes = {}
+        # Engines no running job accounts for, by worktree, for the page.
+        self.outside = []
         self.seq = 0
         self.started = now()
         self.observed = 0
@@ -682,15 +981,16 @@ class Queue(object):
                 conn.execute(
                     "INSERT INTO runs (job_id, tree, tree_path, script, arg,"
                     " slots, gpu, exclusive, engines, exit, verdict, dur_s,"
-                    " queued_s, eta_s, observed_max_procs, finished, daemon_sha)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " queued_s, eta_s, observed_max_procs, finished, daemon_sha,"
+                    " size)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (row.get("id"), row.get("tree"), row.get("tree_path", ""),
                      row.get("script"), row.get("arg"), row.get("slots", 0),
                      row.get("gpu", 0), int(bool(row.get("exclusive"))),
                      row.get("engines", 0), row.get("exit"), row.get("verdict"),
                      row.get("dur_s"), row.get("queued_s"), row.get("eta_s"),
                      row.get("observed_max_procs", 0), row.get("finished"),
-                     self.sha),
+                     self.sha, row.get("size")),
                 )
         except Exception as exc:
             sys.stderr.write("history write failed: %r\n" % (exc,))
@@ -709,8 +1009,15 @@ class Queue(object):
     def refresh_observed(self, force=False):
         if not force and now() - self.observed_at < TASKLIST_CACHE_SECONDS:
             return
-        self.observed = count_godot()
+        table = process_table()
+        seen = count_godot(table)
         self.observed_at = now()
+        if seen is None:
+            # Keep the last count. Reading "could not look" as "nothing there"
+            # tells an exclusive job the box is quiet when it is not.
+            return
+        self.observed = seen
+        self.outside = self.engines_outside(table)
         expected = sum(int(l.get("engines", 0)) for l in self.leases.values())
         stray = max(0, self.observed - expected)
         # Two consecutive samples before we believe it. A single sample catches
@@ -724,6 +1031,36 @@ class Queue(object):
                 int(lease.get("observed_max_procs", 0)), self.observed
             )
 
+    def engines_outside(self, table):
+        """The engines no running job accounts for, grouped by the worktree
+        they are running out of: [{"tree", "path", "engines"}], busiest first.
+
+        "N unmanaged engines" was never enough to act on. Two thirds of all
+        runs share the box with engines the queue did not start, and the only
+        way to find out whose was to go and read command lines. This is not
+        the number the scheduler docks capacity by -- that stays the plain
+        count over what was booked -- it is who to go and talk to.
+        """
+        mine = set()
+        for lease in self.leases.values():
+            mine.update(subtree(table, int(lease.get("winpid") or 0)))
+        trees = [l.get("tree_path") for l in self.leases.values()]
+        groups = {}
+        for pid, (_, name, cmdline, _) in table.items():
+            if pid in mine or not is_engine(name):
+                continue
+            if any(engine_of(pid, cmdline, tree) for tree in trees if tree):
+                continue
+            found = ENGINE_PATH.search(cmdline or "")
+            project = norm_path(found.group(1) or found.group(2)) if found else ""
+            if not re.match(r"^[a-z]:/", project):
+                project = norm_path(process_cwd(pid))
+            label = tree_label(project) if project else "unknown"
+            row = groups.setdefault(label, {"tree": label, "path": project,
+                                            "engines": 0})
+            row["engines"] += 1
+        return sorted(groups.values(), key=lambda g: (-g["engines"], g["tree"]))
+
     # -- the scheduler ----------------------------------------------------
 
     def tick(self):
@@ -736,10 +1073,184 @@ class Queue(object):
                 self.save_state()
                 self.changed.notify_all()
             busy = bool(self.leases or self.queue)
+            suspects = self.stall_suspects()
+            overrun = self.ceiling_breaches()
         # Outside the lock: spawning a process is not something to hold the
         # scheduler for, and nothing below touches queue state.
         self.follow_tray(busy)
+        if suspects or overrun:
+            self.rescue_stalled(suspects, overrun)
         return granted
+
+    def other_shells(self, lease_id):
+        """The pids every other running job is judged by. Holds the lock."""
+        return [int(l.get("winpid") or 0) for l in self.leases.values()
+                if l["id"] != lease_id and l.get("winpid")]
+
+    def stall_suspects(self):
+        """Ids of the leases late enough to be worth a look at their processes,
+        and due one. Holds the lock."""
+        due = []
+        for lease_id, lease in self.leases.items():
+            if lease.get("idle_ok"):
+                # A window somebody is meant to be looking at. Its client said
+                # so; the ceiling is still there for it.
+                continue
+            eta = lease.get("eta_s")
+            limit = STALL_UNKNOWN_SECONDS
+            if eta is not None:
+                limit = max(STALL_FLOOR_SECONDS, STALL_ETA_FACTOR * float(eta))
+            if now() - float(lease.get("granted_at") or now()) <= limit:
+                continue
+            last = self.stall_samples.get(lease_id)
+            if last is None or now() - last["at"] >= STALL_SAMPLE_SECONDS:
+                due.append(lease_id)
+        return due
+
+    def ceiling_of(self, lease):
+        """Seconds this lease may hold its slots with somebody waiting,
+        however busy it looks. What its client declared, or else far past
+        anything honest: see CEILING_SECONDS."""
+        declared = lease.get("max_s")
+        if declared:
+            return float(declared)
+        eta = lease.get("eta_s")
+        if eta is None:
+            return CEILING_SECONDS
+        return max(CEILING_SECONDS, CEILING_ETA_FACTOR * float(eta))
+
+    def ceiling_breaches(self):
+        """Ids of the leases past their ceiling, if anybody is waiting. Holds
+        the lock."""
+        if not self.queue:
+            return []
+        return [lease_id for lease_id, lease in self.leases.items()
+                if now() - float(lease.get("granted_at") or now())
+                > self.ceiling_of(lease)]
+
+    def stall_sample(self, lease, table):
+        """Take a cpu reading of the lease's processes. True once they have sat
+        idle for STALL_QUIET_SECONDS. Holds the lock.
+
+        The processes are the shell's subtree plus the engines running out of
+        the lease's worktree. The second half is not a tidy-up: a bash client's
+        engines are never under its shell, so for run_test.sh and run_clip.sh
+        the subtree is one sleeping bash and the worktree match is the whole
+        measurement. It is engine_in_tree's match, so the main checkout is not
+        kept looking busy by its worktrees, nor a worktree by its neighbours.
+
+        An engine that cannot be placed -- a relative `--path` and a working
+        directory that would not read -- counts for every lease it might
+        belong to. That is the side to err on here: it can only make a lease
+        look busy.
+
+        A changed set of pids counts as busy whatever the cpu says. A shoot
+        that runs a hundred four-second engines can put a whole one between two
+        readings, and its cpu time leaves the table with it.
+        """
+        root = int(lease.get("winpid") or 0)
+        if root not in table:
+            return False
+        pids = subtree(table, root)
+        spared = set()
+        for other in self.other_shells(lease["id"]):
+            spared.update(subtree(table, other))
+        for pid, (_, name, cmdline, _) in table.items():
+            if pid in pids or pid in spared or GODOT_MATCH not in name.lower():
+                continue
+            if engine_of(pid, cmdline, lease.get("tree_path")) is not False:
+                pids.append(pid)
+        cpu = dict((pid, table[pid][3]) for pid in pids)
+        last = self.stall_samples.get(lease["id"])
+        self.stall_samples[lease["id"]] = {"at": now(), "cpu": cpu}
+        if last is None:
+            lease.pop("quiet_since", None)
+            return False
+        burned = sum(max(0.0, cpu[pid] - last["cpu"][pid])
+                     for pid in cpu if pid in last["cpu"])
+        if (set(cpu) != set(last["cpu"])
+                or burned >= STALL_IDLE_CORES * (now() - last["at"])):
+            lease.pop("quiet_since", None)
+            return False
+        lease.setdefault("quiet_since", last["at"])
+        return now() - lease["quiet_since"] >= STALL_QUIET_SECONDS
+
+    def rescue_stalled(self, suspects, overrun=()):
+        """Kill a lease that is in somebody's way and is not coming back, and
+        hand its slots on. Takes the lock itself, and not around the slow
+        parts.
+
+        Two ways to qualify. `suspects` are late and get their processes read;
+        one that has sat idle long enough is `stalled`. `overrun` are past
+        their ceiling and are not read at all -- a run spinning in a loop
+        looks exactly like work, which is what the ceiling is for -- and those
+        are `overran`.
+
+        Only with a queue, either way. A hung run on an otherwise empty box is
+        costing nobody anything, and it may be a window somebody is looking
+        at. It is still watched, so the first job to queue behind it does not
+        then wait out the five minutes.
+
+        The kill is the cancel button's: the shell's subtree and the worktree's
+        engines, sparing what is under another lease. For a stalled lease
+        nothing it reaches was working -- every engine the sweep can match was
+        in the reading that just came back idle, which is the only reason a
+        kill nobody asked for is allowed to sweep at all. An engine that could
+        not be placed counted towards that reading and is not killed: it kept
+        nobody waiting if it was busy, and if it was idle it may still be
+        somebody else's.
+
+        The job's owner is usually an agent that will see only a dead process,
+        so what happened is left as a note for its worktree's next acquire.
+        """
+        table = process_table() if suspects else {}
+        doomed = []
+        with self.lock:
+            waiting = len(self.queue)
+            for lease_id in suspects:
+                lease = self.leases.get(lease_id)
+                if lease is None or not table:
+                    continue
+                if self.stall_sample(lease, table) and waiting:
+                    doomed.append((dict(lease), self.other_shells(lease_id),
+                                   "stalled", "idle for %ds"
+                                   % (now() - lease["quiet_since"])))
+            for lease_id in overrun:
+                lease = self.leases.get(lease_id)
+                if (lease is None or not waiting
+                        or any(d[0]["id"] == lease_id for d in doomed)):
+                    continue
+                doomed.append((dict(lease), self.other_shells(lease_id),
+                               "overran", "past its %ds ceiling"
+                               % self.ceiling_of(lease)))
+        for lease, spare, verdict, why in doomed:
+            what = ("%s %s" % (lease.get("script", ""), lease.get("arg", ""))).strip()
+            text = ("%s %s after %ds (estimate %s): %s with %d job(s) waiting"
+                    % (what, verdict, now() - lease["granted_at"],
+                       "none" if lease.get("eta_s") is None
+                       else "%ds" % lease["eta_s"], why, waiting))
+            sys.stderr.write("%s %s -- killing it\n" % (lease["id"], text))
+            sys.stderr.flush()
+            lease["note"] = text
+            kill_job(lease.get("winpid"), lease.get("tree_path", ""), spare)
+        if not doomed:
+            return
+        with self.lock:
+            for lease, _, verdict, _ in doomed:
+                if self.finish(lease["id"], None, verdict):
+                    self.notes[lease.get("tree_id", "")] = (
+                        "testq killed your last run here -- " + lease["note"]
+                        + ". If it was meant to take that long, say so with"
+                        " max_s (maxSeconds), or idle_ok (idleOk) for a window"
+                        " that is meant to sit there.", now())
+            self.grant_pass()
+            self.save_state()
+            self.changed.notify_all()
+
+    def note_for(self, tree_id):
+        """The note left for this worktree, once. Holds the lock."""
+        text, at = self.notes.pop(tree_id, ("", 0))
+        return text if now() - at <= NOTE_SECONDS else ""
 
     def follow_tray(self, busy):
         """Raise the notification-area icon when the box goes from idle to busy.
@@ -771,13 +1282,81 @@ class Queue(object):
                 dead.append(lease_id)
         for lease_id in dead:
             self.finish(lease_id, exit_code=None, verdict="reclaimed")
+        # A queued client is gone when it has stopped polling -- or when its
+        # process has, which is known at once. Waiting on the polls alone took
+        # up to a minute and a half: the long poll a dead client left behind
+        # keeps refreshing the ticket until it returns to nobody.
         stale = [t for t in self.queue
-                 if now() - t.get("last_poll", t["enqueued_at"]) > TICKET_STALE_SECONDS]
+                 if now() - t.get("last_poll", t["enqueued_at"]) > TICKET_STALE_SECONDS
+                 or (t.get("winpid") and not process_alive(t["winpid"], None))]
         for ticket in stale:
             self.queue.remove(ticket)
             self.append_history(self.history_row(ticket, None, "abandoned"))
+            self.parked[self.park_key(ticket)] = (ticket["enqueued_at"], now())
+        for key in [k for k, (_, left) in self.parked.items()
+                    if now() - left > PARK_SECONDS]:
+            del self.parked[key]
         if dead or stale:
             self.save_state()
+
+    def park_key(self, ticket):
+        return (ticket.get("tree_id", ""), ticket.get("script", ""),
+                ticket.get("arg", ""))
+
+    def start_in(self, ticket, order):
+        """A rough (seconds until `ticket` starts, whether that is only a
+        floor). Holds the lock.
+
+        Rough on purpose: one line of arithmetic over the estimates already on
+        the tickets, with no attempt to replay the scheduler. Its job is to
+        let a caller decide between waiting and coming back -- a session whose
+        command will be killed in ten minutes needs to know that the wait is
+        twenty -- and "about twelve minutes" does that as well as 11m40s.
+
+        A job with no estimate adds nothing and turns the answer into a floor,
+        which is said out loud to the client rather than hidden in a guess.
+        """
+        floor = [False]
+
+        def length(job, started=None):
+            eta = job.get("eta_s")
+            if eta is None:
+                floor[0] = True
+                return 0.0
+            if started is None:
+                return float(eta)
+            return max(15.0, float(eta) - (now() - float(started)))
+
+        need_cpu, need_gpu = self.need_of(ticket)
+        ahead = order[:order.index(ticket)] if ticket in order else []
+        if ticket.get("exclusive"):
+            wait = max([length(l, l.get("granted_at") or now())
+                        for l in self.leases.values()] or [0.0])
+            wait += sum(length(t) for t in ahead)
+        elif need_gpu > 0:
+            # One line for the GPU: whoever has it, then everybody ahead who
+            # wants it.
+            wait = sum(length(l, l.get("granted_at") or now())
+                       for l in self.leases.values() if self.need_of(l)[1] > 0)
+            wait += sum(length(t) for t in ahead if self.need_of(t)[1] > 0)
+            wait /= float(max(1, self.capacity["gpu"]))
+        else:
+            # Slot-seconds of work ahead, spread over the slots. A ticket in
+            # the GPU line is not ahead of a CPU-only one: it is passed.
+            work = sum(length(l, l.get("granted_at") or now()) * self.need_of(l)[0]
+                       for l in self.leases.values())
+            work += sum(length(t) * self.need_of(t)[0] for t in ahead
+                        if self.need_of(t)[1] == 0)
+            free = self.capacity["cpu"] - sum(self.need_of(l)[0]
+                                              for l in self.leases.values())
+            wait = 0.0 if free >= need_cpu else work / float(max(1, self.capacity["cpu"]))
+        if wait <= 0:
+            # Queued, and nothing with an estimate is in its way: it is waiting
+            # on a mutex, or on engines the queue did not start. Nobody knows
+            # when those end, and "starts in 0s" would be a lie told twice a
+            # minute.
+            return None, True
+        return round(wait), floor[0]
 
     def order(self):
         """Queue order: short jobs first, with aging so nothing starves.
@@ -787,12 +1366,20 @@ class Queue(object):
         two eleven-minute suites. The aging term is what keeps that honest --
         once a ticket has waited past max(600s, twice its own estimate) it
         goes to the front in arrival order and short jobs stop overtaking it.
+
+        A ticket with no estimate ages at the floor. It SORTS as long, which
+        is right, but it must not AGE as long: twice UNKNOWN_ETA is twenty-three
+        days, and a first-ever capture script sat at the back for as long as
+        estimated work kept arriving.
         """
         def key(ticket):
             eta = ticket.get("eta_s")
-            eta = UNKNOWN_ETA if eta is None else float(eta)
             waited = now() - ticket["enqueued_at"]
-            aged = waited > max(AGE_FLOOR_SECONDS, 2.0 * min(eta, UNKNOWN_ETA))
+            limit = AGE_FLOOR_SECONDS
+            if eta is not None:
+                limit = max(limit, 2.0 * float(eta))
+            eta = UNKNOWN_ETA if eta is None else float(eta)
+            aged = waited > limit
             if aged:
                 return (0, ticket["enqueued_at"], 0.0)
             return (1, eta, ticket["enqueued_at"])
@@ -809,6 +1396,7 @@ class Queue(object):
 
         granted = []
         reserved_mutexes = set()
+        reserved_gpu = 0
         for ticket in self.order():
             need_cpu, need_gpu = self.need_of(ticket)
             mutexes = list(ticket.get("mutexes", []))
@@ -826,7 +1414,7 @@ class Queue(object):
                 quiet = self.stray == 0 or waited > EXCLUSIVE_STRAY_PATIENCE
                 fits = not self.leases and quiet
             if not fits and self.try_shrink(ticket, blocked_mutex, free_cpu,
-                                            free_gpu):
+                                            free_gpu, reserved_gpu > 0):
                 need_cpu, need_gpu = self.need_of(ticket)
                 fits = True
             if fits:
@@ -837,23 +1425,51 @@ class Queue(object):
             else:
                 # Head-of-line reservation. What this ticket cannot get yet is
                 # held back from everyone behind it, so a four-slot job is not
-                # starved by a stream of one-slot jobs -- but a job blocked
-                # purely on the GPU still lets CPU-only work past.
-                free_cpu = max(0, free_cpu - need_cpu)
+                # starved by a stream of one-slot jobs.
+                #
+                # A ticket that is short of nothing but the GPU reserves no
+                # CPU at all. There is always a line for the GPU on this box,
+                # so a slot held for the head of it is a slot idle all day --
+                # and the head does not need it: whoever has the GPU has a
+                # slot too and hands both back together. If a shorter CPU job
+                # takes that slot first, the ticket is then short of CPU, and
+                # reserves like anything else.
+                #
+                # Nor does one that is further back in the GPU line than the
+                # GPU is deep, whatever else it is short of: it cannot start
+                # until the ones ahead have finished and given their slots
+                # back. Reserving for each of them parked a CPU-only suite
+                # behind four queued clips with three cores idle.
+                #
+                # An exclusive job is in neither case -- it is waiting for the
+                # whole box -- so it always reserves.
+                gpu_alone = (not blocked_mutex and need_cpu <= free_cpu
+                             and need_gpu > free_gpu)
+                behind_gpu = (need_gpu > 0
+                              and reserved_gpu + need_gpu > self.capacity["gpu"])
+                if ticket.get("exclusive") or not (gpu_alone or behind_gpu):
+                    free_cpu = max(0, free_cpu - need_cpu)
+                reserved_gpu += need_gpu
                 free_gpu = max(0, free_gpu - need_gpu)
                 reserved_mutexes.update(mutexes)
                 ticket["blocked_on"] = self.explain(ticket, blocked_mutex)
         return granted
 
-    def eta_until_free(self, want_more):
+    def eta_until_free(self, want_more, gpu_line=False):
         """A rough time until `want_more` further cpu slots come free, off the
         running leases' own estimates, assuming nothing new is granted first.
+        With `gpu_line`, somebody ahead in the queue is waiting for the GPU,
+        and that assumption is false for exactly one kind of lease: the slot
+        a GPU job gives back goes to the next GPU job, not to the caller. A
+        suite one slot short was told "fifteen seconds" by every clip in turn.
         Floored per lease at 15 s: a lease already past its estimate could end
         any second, but assuming zero would make every shrink decision read
         "the wait is free" exactly when the estimate has already been wrong.
         """
         rel = []
         for l in self.leases.values():
+            if gpu_line and self.need_of(l)[1] > 0:
+                continue
             eta = l.get("eta_s")
             eta = UNKNOWN_ETA if eta is None else float(eta)
             remaining = max(15.0, eta - (now() - float(l.get("granted_at") or now())))
@@ -866,7 +1482,8 @@ class Queue(object):
                 return remaining
         return float("inf")
 
-    def try_shrink(self, ticket, blocked_mutex, free_cpu, free_gpu):
+    def try_shrink(self, ticket, blocked_mutex, free_cpu, free_gpu,
+                   gpu_line=False):
         """Grant a flexible job narrower than it asked, when that answers
         sooner than waiting for the full width.
 
@@ -898,7 +1515,7 @@ class Queue(object):
             return False
         grant = min(want, free_cpu)
         work = float(eta) * want
-        wait = self.eta_until_free(want - free_cpu)
+        wait = self.eta_until_free(want - free_cpu, gpu_line)
         if work / grant >= wait + work / want:
             return False
         ticket["slots"] = grant
@@ -980,6 +1597,7 @@ class Queue(object):
             "dur_s": round(now() - granted, 1) if granted else 0.0,
             "queued_s": round((granted or now()) - job["enqueued_at"], 1),
             "eta_s": job.get("eta_s"),
+            "size": job.get("size"),
             "observed_max_procs": job.get("observed_max_procs", 0),
             "finished": now(),
         }
@@ -988,6 +1606,7 @@ class Queue(object):
         lease = self.leases.pop(lease_id, None)
         if lease is None:
             return False
+        self.stall_samples.pop(lease_id, None)
         for key in list(self.held_mutex):
             if self.held_mutex[key] == lease_id:
                 del self.held_mutex[key]
@@ -1005,6 +1624,11 @@ class Queue(object):
             eta = body.get("eta_s")
             if eta is None:
                 eta = self.estimate(script, arg, tree_id, body)
+            max_s = body.get("max_s")
+            try:
+                max_s = float(max_s) if max_s else None
+            except (TypeError, ValueError):
+                max_s = None
             slots_val = max(0, int(body.get("slots", 1)))
             # A flexible job: "slots is what I want, slots_min is what I can
             # run on". 0 or absent means rigid, which is every job that runs
@@ -1033,10 +1657,29 @@ class Queue(object):
                 "last_poll": now(),
                 "granted_at": None,
                 "eta_s": eta,
+                # How much work this is, in whatever the job counts in --
+                # seconds to record, scenarios to shoot. See sized_estimate.
+                "size": arg_size(arg, body.get("size"))[1],
+                # See ceiling_of and stall_suspects.
+                "max_s": max_s,
+                "idle_ok": bool(body.get("idle_ok", False)),
                 "blocked_on": "",
                 "observed_max_procs": 0,
                 "box_engines": 0,
             }
+            # A retry can be here before the tick that would notice its
+            # predecessor died -- an agent whose command timed out asks again
+            # within the second. Clear the dead out first so that it is parked
+            # in time to be picked up.
+            self.reap()
+            parked = self.parked.pop(self.park_key(ticket), None)
+            if parked and now() - parked[1] <= PARK_SECONDS:
+                # The same job from the same worktree, back after its client
+                # died in the queue. It keeps the wait it had already done,
+                # which is what puts it ahead of whatever arrived since and
+                # what ages it to the front on time.
+                ticket["enqueued_at"] = parked[0]
+                ticket["resumed_s"] = round(now() - parked[0], 1)
             self.queue.append(ticket)
             self.grant_pass()
             self.save_state()
@@ -1056,6 +1699,11 @@ class Queue(object):
                 return eta
         elif script.startswith("run_test"):
             eta = suite_eta(tree_id, arg or "all", 1, project)
+            if eta is not None:
+                return eta
+        kind, size = arg_size(arg, body.get("size"))
+        if size:
+            eta = self.sized_estimate(script, kind, size)
             if eta is not None:
                 return eta
         # Anything else -- run_mp, shots, clips -- has no weights file, and a
@@ -1082,7 +1730,66 @@ class Queue(object):
             if len(row) >= 2:
                 durations = sorted(float(r["dur_s"]) for r in row)
                 return round(durations[len(durations) // 2], 1)
+        # Last, the script with any argument at all. Wrong by a lot for a
+        # script whose arguments differ by a lot, and still better than
+        # nothing: a job with no estimate sorts behind everything that has
+        # one, and more than a quarter of all jobs used to arrive with none.
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT dur_s FROM runs WHERE script=? AND"
+                    " verdict='released' AND dur_s > 0"
+                    " ORDER BY finished DESC LIMIT 15", (script,)
+                ).fetchall()
+        except Exception:
+            return None
+        if len(row) >= 3:
+            durations = sorted(float(r["dur_s"]) for r in row)
+            return round(durations[len(durations) // 2], 1)
         return None
+
+    def sized_estimate(self, script, kind, size):
+        """Seconds for `size` units of `kind`, off what other sizes took.
+
+        The estimate is keyed on script and arg, and for a lot of jobs the arg
+        is not what decides how long they take. `capture-warehouse.mjs
+        warehouse` is 48 s recording thirty seconds and ten minutes recording
+        five hundred; `sm64-shoot-game.mjs "148 scenarios"` has never been run
+        before at exactly 148. Both are a fixed cost plus so much a unit, so
+        that is what is fitted: a straight line through this script's recent
+        runs of the same kind.
+
+        Two or more runs at this very size win over the line -- they are the
+        measurement, the line is the guess.
+        """
+        try:
+            with db() as conn:
+                rows = conn.execute(
+                    "SELECT arg, size, dur_s FROM runs WHERE script=? AND"
+                    " verdict='released' AND dur_s > 0"
+                    " ORDER BY finished DESC LIMIT 80", (script,)
+                ).fetchall()
+        except Exception:
+            return None
+        points = []
+        for r in rows:
+            row_kind, row_size = arg_size(r["arg"], r["size"])
+            if row_kind == kind and row_size:
+                points.append((row_size, float(r["dur_s"])))
+        same = sorted(d for s, d in points if abs(s - size) <= 0.01 * size)
+        if len(same) >= 2:
+            return round(same[len(same) // 2], 1)
+        if len(points) < 3 or len(set(s for s, _ in points)) < 2:
+            return None
+        n = float(len(points))
+        mean_s = sum(s for s, _ in points) / n
+        mean_d = sum(d for _, d in points) / n
+        spread = sum((s - mean_s) ** 2 for s, _ in points)
+        slope = sum((s - mean_s) * (d - mean_d) for s, d in points) / spread
+        if slope <= 0:
+            # Bigger jobs coming out faster is noise, not a law.
+            return None
+        return round(max(1.0, mean_d + slope * (size - mean_s)), 1)
 
     def find(self, job_id):
         with self.lock:
@@ -1110,9 +1817,12 @@ class Queue(object):
                 if remaining <= 0:
                     order = self.order()
                     position = order.index(ticket) + 1 if ticket in order else 0
+                    start_in, floor = self.start_in(ticket, order)
                     return {
                         "granted": False,
                         "position": position,
+                        "start_in_s": start_in,
+                        "start_in_floor": floor,
                         "waiting_s": round(now() - ticket["enqueued_at"], 1),
                         "blocked_on": ticket.get("blocked_on", ""),
                         "ahead": [self.brief(t) for t in order[:position - 1][:4]],
@@ -1151,7 +1861,8 @@ class Queue(object):
             self.cancelled.add(job_id)
             if job_id in self.leases:
                 lease = self.leases[job_id]
-                kill_job(lease.get("winpid"), lease.get("tree_path", ""))
+                kill_job(lease.get("winpid"), lease.get("tree_path", ""),
+                         self.other_shells(job_id))
                 self.finish(job_id, None, "cancelled")
                 self.grant_pass()
                 self.save_state()
@@ -1183,6 +1894,7 @@ class Queue(object):
                 row = dict(ticket)
                 row["position"] = i + 1
                 row["waiting_s"] = round(now() - ticket["enqueued_at"], 1)
+                row["start_in_s"], row["start_in_floor"] = self.start_in(ticket, order)
                 queued.append(row)
             return {
                 "now": now(),
@@ -1199,6 +1911,7 @@ class Queue(object):
                     "observed": self.observed,
                     "expected": sum(int(l.get("engines", 0)) for l in self.leases.values()),
                     "unmanaged": self.stray,
+                    "outside": list(self.outside),
                 },
                 "running": running,
                 "queued": queued,
@@ -1223,12 +1936,15 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(payload).encode("utf-8")
         else:
             body = payload.encode("utf-8") if isinstance(payload, str) else payload
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
+        # A client killed while it waits has hung up by the time its long poll
+        # comes back, and the headers are the first thing to find that out.
+        # That is every abandoned ticket; it is not worth a traceback each.
         try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             self.wfile.write(body)
         except Exception:
             pass
@@ -1273,17 +1989,30 @@ class Handler(BaseHTTPRequestHandler):
             with self.queue.lock:
                 granted = ticket["id"] in self.queue.leases
                 position, blocked = 0, ""
+                start_in, floor = 0, False
                 if not granted:
                     order = self.queue.order()
                     position = next((i + 1 for i, t in enumerate(order)
                                      if t["id"] == ticket["id"]), 0)
                     blocked = ticket.get("blocked_on", "")
+                    start_in, floor = self.queue.start_in(ticket, order)
+                note = self.queue.note_for(ticket.get("tree_id", ""))
             return self._send(200, {
                 "ticket": ticket["id"],
                 "eta_s": ticket.get("eta_s"),
                 "granted": granted,
                 "position": position,
                 "blocked_on": blocked,
+                # Roughly when a queued ticket starts, and whether that is only
+                # a floor because something ahead of it has no estimate.
+                "start_in_s": start_in,
+                "start_in_floor": floor,
+                # Set when this ticket picked up the wait of one whose client
+                # died in the queue: how long it has now been waiting in all.
+                "resumed_s": ticket.get("resumed_s", 0),
+                # Something this worktree should be told -- today, only that
+                # its last run was killed here and why.
+                "note": note,
                 # Only meaningful when granted is true; a queued ticket has no
                 # grant to describe yet and the client reads it again off the
                 # /wait response that finally grants it.
@@ -1443,8 +2172,20 @@ function render(s) {
 
   $("banner").innerHTML = s.godot.unmanaged > 0
     ? '<div class="banner">' + s.godot.unmanaged + ' Godot engine(s) running outside the queue' +
-      ' &mdash; capacity reduced to match. A worktree without the queue shim, or the editor.</div>'
+      ' &mdash; capacity reduced to match. A worktree without the queue shim, or the editor.' +
+      outside(s) + '</div>'
     : "";
+
+  function outside(s) {
+    const rows = s.godot.outside || [];
+    if (!rows.length) return "";
+    return "<br>" + rows.map(g => "<span class='mono'>" + esc(g.tree) + "</span> &times;" +
+      g.engines).join(", ");
+  }
+  function startsIn(q) {
+    if (q.start_in_s == null) return "--";
+    return (q.start_in_floor ? "&ge; " : "~") + dur(Math.max(0, q.start_in_s - drift));
+  }
 
   if (!s.running.length) $("running").innerHTML = '<div class="empty">nothing running</div>';
   else $("running").innerHTML = '<table><tr><th>Worktree</th><th>Job</th><th>Slots</th>' +
@@ -1456,7 +2197,8 @@ function render(s) {
       return "<tr><td class='mono'>" + who(r) + "</td><td>" + job(r) + "</td>" +
         "<td class='tag'>" + (r.exclusive ? "exclusive" : r.slots + " cpu" +
           (r.gpu ? " + gpu" : "")) + "</td>" +
-        "<td class='mono'>" + dur(el) + "</td>" +
+        "<td class='mono'>" + dur(el) + (r.quiet_since ? " <span class='tag'>idle " +
+          dur(s.now + drift - r.quiet_since) + "</span>" : "") + "</td>" +
         "<td>" + (r.eta_s ? '<div class="bar"><span class="' + (over ? "over" : "") +
           '" style="width:' + pct + '%"></span></div><span class="tag">~' + dur(r.eta_s) +
           "</span>" : '<span class="tag">no estimate</span>') + "</td>" +
@@ -1465,10 +2207,11 @@ function render(s) {
 
   if (!s.queued.length) $("queued").innerHTML = '<div class="empty">queue is empty</div>';
   else $("queued").innerHTML = '<table><tr><th>#</th><th>Worktree</th><th>Job</th>' +
-    '<th>Waiting</th><th>Estimate</th><th>Blocked on</th><th></th></tr>' +
+    '<th>Waiting</th><th>Starts in</th><th>Estimate</th><th>Blocked on</th><th></th></tr>' +
     s.queued.map(q => "<tr><td class='mono'>" + q.position + "</td><td class='mono'>" +
       who(q) + "</td><td>" + job(q) + "</td><td class='mono'>" +
-      dur((q.waiting_s || 0) + drift) + "</td><td class='tag'>" +
+      dur((q.waiting_s || 0) + drift) + "</td><td class='tag'>" + startsIn(q) +
+      "</td><td class='tag'>" +
       (q.eta_s ? "~" + dur(q.eta_s) : "--") + "</td><td class='tag'>" +
       esc(q.blocked_on) + "</td><td><button onclick=\"cancel('" + q.id + "','" +
       job(q) + "')\">cancel</button></td></tr>").join("") + "</table>";
@@ -1481,6 +2224,10 @@ function render(s) {
       if (h.verdict === "released") {
         cls = h.exit === 0 ? "exit0" : h.exit === 2 ? "exit2" : "exit1";
         txt = h.exit === 0 ? "pass" : "exit " + h.exit;
+      } else if (h.verdict === "stalled" || h.verdict === "overran") {
+        // Killed here, by us. That is a failure somebody should read about.
+        cls = "exit1";
+        txt = "killed: " + h.verdict;
       }
       return "<tr><td class='mono'>" + esc(h.tree) + "</td><td>" + job(h) +
         "</td><td class='" + cls + "'>" + esc(txt) + "</td><td class='mono'>" +
@@ -1801,14 +2548,25 @@ def cmd_status(args):
              "  (%d unmanaged)" % state["godot"]["unmanaged"]
              if state["godot"]["unmanaged"] else ""))
     for r in state["running"]:
-        print("  RUN   %-34s %-16s %8s / %-8s %s"
+        idle = ""
+        if r.get("quiet_since"):
+            idle = "  idle " + fmt_dur(state["now"] - r["quiet_since"])
+        print("  RUN   %-34s %-16s %8s / %-8s %s%s"
               % (r["tree_id"][:34], (r["script"] + " " + (r["arg"] or "")).strip(),
-                 fmt_dur(r.get("elapsed_s")), fmt_dur(r.get("eta_s")), r["id"]))
+                 fmt_dur(r.get("elapsed_s")), fmt_dur(r.get("eta_s")), r["id"],
+                 idle))
     for q in state["queued"]:
-        print("  WAIT %d %-34s %-16s waiting %-8s %s"
+        starts = ""
+        if q.get("start_in_s") is not None:
+            starts = "  starts in %s%s" % (">=" if q.get("start_in_floor") else "~",
+                                           fmt_dur(q["start_in_s"]))
+        print("  WAIT %d %-34s %-16s waiting %-8s %s%s"
               % (q["position"], q["tree_id"][:34],
                  (q["script"] + " " + (q["arg"] or "")).strip(),
-                 fmt_dur(q.get("waiting_s")), q.get("blocked_on", "")))
+                 fmt_dur(q.get("waiting_s")), q.get("blocked_on", ""), starts))
+    for g in state["godot"].get("outside", []):
+        print("  OUT   %-34s %d engine(s) not started by a running job"
+              % (g["tree"][:34], g["engines"]))
     if not state["running"] and not state["queued"]:
         print("  idle")
     return 0

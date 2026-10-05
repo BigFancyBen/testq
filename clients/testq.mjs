@@ -11,13 +11,23 @@
  * Usage:
  *
  *   import { acquire } from './lib/testq.mjs';
- *   const slot = await acquire({ script: 'capture.mjs', arg: 'warehouse', gpu: 1 });
+ *   const slot = await acquire({
+ *     script: 'capture.mjs', arg: 'warehouse', gpu: 1,
+ *     size: seconds,              // how much work, so the estimate can scale
+ *     maxSeconds: seconds + 240,  // past this, something has hung: stop
+ *   });
  *   try { ...launch the engine... } finally { slot.release(process.exitCode ?? 0); }
+ *
+ * Give every job a `maxSeconds`. The bash harnesses wrap each engine in
+ * `timeout`; nothing does that for a Node one, and an engine that finishes its
+ * work and never exits then holds the GPU until somebody notices -- one did,
+ * for two hours. With `maxSeconds` this file ends the run itself: it gives the
+ * slot back, kills everything it started, and exits 124.
  *
  * Environment: TESTQ=on|off|require, TESTQ_PORT, TESTQ_AUTOSTART=0|1, TESTQ_HOME.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
@@ -30,6 +40,63 @@ const AUTOSTART = process.env.TESTQ_AUTOSTART !== '0';
 
 /** A no-op slot, so callers never have to branch on whether queueing happened. */
 const UNQUEUED = { queued: false, boxEngines: 0, release() {} };
+
+const warn = (msg) => process.stderr.write(`!!! ${msg}\n`);
+const say = (msg) => process.stderr.write(`[testq] ${msg}\n`);
+
+function span(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return s < 90 ? `${s}s` : `${Math.round(s / 60)}m`;
+}
+
+/** "starts in ~12m", or "" when the daemon is too old to say. */
+function startsIn(body) {
+  if (body?.start_in_s == null) return '';
+  return `starts in ${body.start_in_floor ? 'at least ' : '~'}${span(body.start_in_s)}`;
+}
+
+/**
+ * Stop everything this process started, then this process. `taskkill /T` walks
+ * the real parent links, which for a Node harness are intact: node, its
+ * driver, the engine. The filter leaves this process out of it so that it can
+ * exit with a code of its own choosing rather than taskkill's.
+ */
+function killOwnTree(code) {
+  if (process.platform === 'win32') {
+    spawnSync(
+      'taskkill',
+      ['/F', '/T', '/PID', String(process.pid), '/FI', `PID ne ${process.pid}`],
+      { stdio: 'ignore', windowsHide: true },
+    );
+  }
+  process.exit(code);
+}
+
+/**
+ * The deadline. Runs whether or not there is a daemon, because a hung engine
+ * is a hung engine either way -- so it is armed on the unqueued slot too.
+ */
+function withDeadline(slot, job) {
+  const limit = Number(job.maxSeconds) || 0;
+  if (limit <= 0) return slot;
+  const release = slot.release.bind(slot);
+  const timer = setTimeout(async () => {
+    warn(
+      `${job.script} ${job.arg || ''} is still running after ${span(limit)}, ` +
+        'its maxSeconds — killing it and giving the slot back (exit 124)',
+    );
+    await release(124);
+    killOwnTree(124);
+  }, limit * 1000);
+  // Not a reason to stay alive: a harness that has finished should exit.
+  timer.unref();
+  return Object.assign(slot, {
+    async release(exitCode) {
+      clearTimeout(timer);
+      return release(exitCode);
+    },
+  });
+}
 
 /**
  * The same key the Python side computes, and it has to stay the same: `reap`
@@ -131,12 +198,16 @@ async function startDaemon() {
  * @param {boolean} [job.exclusive] wants a quiet box (timing measurements)
  * @param {string[]} [job.mutexes]  named exclusions, e.g. ['ports:27015']
  * @param {number} [job.etaSeconds] override the estimate
+ * @param {number} [job.size]       how much work this is, in whatever the job
+ *   counts in — seconds to record, scenarios to shoot. The estimate is fitted
+ *   to it, so a ten-minute capture stops being scheduled as a 48-second one.
+ * @param {number} [job.maxSeconds] the longest this may run once it starts.
+ *   Enforced here (see withDeadline) and, with a job waiting, by the daemon.
+ * @param {boolean} [job.idleOk]    a window that is meant to sit there; the
+ *   daemon will not take it for a hang. maxSeconds still applies.
  */
 export async function acquire(job) {
-  if (MODE === 'off') return UNQUEUED;
-
-  const warn = (msg) => process.stderr.write(`!!! ${msg}\n`);
-  const say = (msg) => process.stderr.write(`[testq] ${msg}\n`);
+  if (MODE === 'off') return withDeadline({ ...UNQUEUED }, job);
 
   if (!(await up()) && !(AUTOSTART && (await startDaemon()))) {
     if (MODE === 'require') {
@@ -146,7 +217,7 @@ export async function acquire(job) {
     // Deliberate: infrastructure that can stop you testing is worse than the
     // contention it was built to prevent.
     warn('testq unavailable — running UNQUEUED; wall-clock assertions may flake');
-    return UNQUEUED;
+    return withDeadline({ ...UNQUEUED }, job);
   }
 
   const tree = treeId(job.treePath || process.cwd());
@@ -165,6 +236,9 @@ export async function acquire(job) {
       exclusive: Boolean(job.exclusive),
       mutexes: job.mutexes || [],
       eta_s: job.etaSeconds ?? null,
+      size: job.size ?? null,
+      max_s: job.maxSeconds ?? null,
+      idle_ok: Boolean(job.idleOk),
       winpid: process.pid,
     },
     10000,
@@ -173,29 +247,37 @@ export async function acquire(job) {
   if (request.status === 409 && request.body?.error === 'proto') {
     warn('the testq daemon is older than this client — running UNQUEUED.');
     warn(`    Upgrade it with: ${request.body.hint || 'testq start --restart'}`);
-    return UNQUEUED;
+    return withDeadline({ ...UNQUEUED }, job);
   }
   const ticket = request.body?.ticket;
   if (!ticket) {
     warn('testq gave no ticket — running UNQUEUED');
-    return UNQUEUED;
+    return withDeadline({ ...UNQUEUED }, job);
   }
+  // Left for this worktree by the daemon: today, that its last run was killed
+  // there and why. The run it is about could not be told; it was dead.
+  if (request.body.note) warn(request.body.note);
 
   // boxEngines: how many engines this box is committed to carrying while we
   // run, ours included, as the daemon saw it at the grant. 0 means unknown --
   // unqueued, or a daemon too old to send it. A caller timing anything against
   // the wall clock should assert only at 1, and treat 0 as "assert anyway":
   // infrastructure that silently drops assertions is worse than the flake.
-  const lease = (body) => ({
-    queued: true,
-    released: false,
-    boxEngines: Number(body?.box_engines ?? body?.lease?.box_engines ?? 0),
-    async release(exitCode) {
-      if (this.released) return;
-      this.released = true;
-      await post('release', { lease: ticket, exit_code: exitCode ?? 0 }, 5000);
-    },
-  });
+  // The deadline is armed here, at the grant: time spent queued is free.
+  const lease = (body) =>
+    withDeadline(
+      {
+        queued: true,
+        released: false,
+        boxEngines: Number(body?.box_engines ?? body?.lease?.box_engines ?? 0),
+        async release(exitCode) {
+          if (this.released) return;
+          this.released = true;
+          await post('release', { lease: ticket, exit_code: exitCode ?? 0 }, 5000);
+        },
+      },
+      job,
+    );
 
   if (request.body.granted) return lease(request.body);
 
@@ -204,6 +286,20 @@ export async function acquire(job) {
       `(${request.body.blocked_on || 'waiting'}).`,
   );
   say(`nothing has launched yet; watch ${BASE.replace('127.0.0.1', 'localhost')}/`);
+  if (request.body.resumed_s) {
+    say(`picked up the place of the same job queued ${span(request.body.resumed_s)} ago`);
+  }
+  if (startsIn(request.body)) {
+    say(`${startsIn(request.body)}.`);
+    if (request.body.start_in_s > 240) {
+      // Said once, to whoever started this with a clock running on it. Being
+      // killed in the queue is survivable now, but only by asking again.
+      say(
+        'if your command will time out before then, run it in the background; ' +
+          'a job killed while queued keeps its place for 15 minutes if it asks again.',
+      );
+    }
+  }
 
   const startedWaiting = Date.now();
   for (;;) {
@@ -212,7 +308,7 @@ export async function acquire(job) {
       // The daemon went away mid-wait. Its slots went with it, so there is
       // nothing left to be polite about.
       warn('testq stopped answering — running UNQUEUED');
-      return UNQUEUED;
+      return withDeadline({ ...UNQUEUED }, job);
     }
     const waited = Math.round((Date.now() - startedWaiting) / 1000);
     if (poll.body.granted) {
@@ -225,11 +321,12 @@ export async function acquire(job) {
     }
     if (poll.body.unknown) {
       warn('the daemon forgot this ticket — running UNQUEUED');
-      return UNQUEUED;
+      return withDeadline({ ...UNQUEUED }, job);
     }
+    const starts = startsIn(poll.body);
     say(
       `still queued at position ${poll.body.position || '?'} after ${waited}s — ` +
-        `${poll.body.blocked_on || 'waiting'}`,
+        `${poll.body.blocked_on || 'waiting'}${starts ? `, ${starts}` : ''}`,
     );
   }
 }

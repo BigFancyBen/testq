@@ -63,6 +63,27 @@ worktrees" now name mfrs where they mean mfrs. `tray.ps1` keeps the
 the entire point of it and a vendored copy is still out there using that name —
 which also means an old vendored tray and this one still exclude each other.
 
+**Self-rescue, and what it needed.** A lease that is late and idle, or past a
+ceiling, is killed when something is queued behind it (`stalled`, `overran`).
+Getting that right for worktrees replaced the leaf-name match in `kill_job`
+with `engine_in_tree`, which also fixes cancel: upstream, cancelling a job in
+the main checkout kills the engines of every worktree under it. Worth carrying
+back on its own.
+
+**No WMI.** `process_table` and `count_godot` read the kernel directly; a
+failed look keeps the last engine count instead of reporting zero.
+
+**Optional fields on `/acquire`**: `size`, `max_s`, `idle_ok`. **Added to its
+response and to `/wait`**: `start_in_s`, `start_in_floor`, `resumed_s`, `note`.
+All additive, so `PROTO` is still 1 and an old client is unaffected — it just
+does not print the new lines. `run_lib.sh` would gain the most from sending
+`max_s` (it already knows its `timeout`) and from printing `start_in_s`.
+
+**A `size` column on `runs`**, added by `ALTER TABLE` on first open. The
+vendored copy names its columns on insert and is unaffected.
+
+**Tests.** `tests/test_testq.py`; upstream has none.
+
 ## Collapsing the fork
 
 **In progress: mfrs PR #94** deletes `tools/testq/` and points `run_lib.sh` here

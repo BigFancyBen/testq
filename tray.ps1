@@ -160,10 +160,18 @@ function Update-Tray {
   # A job that has just finished badly is worth one balloon, once.
   $newest = @($state.history)[0]
   if ($newest -and $newest.finished -gt $script:LastFinished) {
-    $bad = ($newest.verdict -eq 'released' -and $newest.exit -ne 0)
+    # Killed by the queue itself -- hung, or past its ceiling -- is as much a
+    # failure to hear about as a bad exit, and the only one with no exit code.
+    $killed = ($newest.verdict -eq 'stalled' -or $newest.verdict -eq 'overran')
+    $bad = $killed -or ($newest.verdict -eq 'released' -and $newest.exit -ne 0)
     if ($script:LastFinished -gt 0 -and $bad) {
-      $notify.BalloonTipTitle = "$($newest.script) $($newest.arg) failed"
-      $notify.BalloonTipText  = "exit $($newest.exit) in $($newest.tree)"
+      if ($killed) {
+        $notify.BalloonTipTitle = "$($newest.script) $($newest.arg) killed: $($newest.verdict)"
+        $notify.BalloonTipText  = "it was holding up the queue, in $($newest.tree)"
+      } else {
+        $notify.BalloonTipTitle = "$($newest.script) $($newest.arg) failed"
+        $notify.BalloonTipText  = "exit $($newest.exit) in $($newest.tree)"
+      }
       $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
       $notify.ShowBalloonTip(6000)
     }

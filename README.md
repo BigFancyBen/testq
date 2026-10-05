@@ -52,6 +52,7 @@ the first time a client asks for it.
     python testq.py stop [--force]
     python testq.py tray              # pin the icon up (it appears by itself)
     python testq.py reap              # delete scratch of deleted worktrees
+    python -m unittest discover tests # the queue's own tests; starts nothing
 
 State, the history database and the daemon's own snapshot live in
 `%LOCALAPPDATA%\testq\` — or in `%LOCALAPPDATA%\mfrs-testq\` when that older
@@ -85,10 +86,27 @@ const slot = await acquire({
   treePath: ROOT,                   // the checkout, for the worktree column
   gpu: 1,                           // it opens a window
   engines: 1,
+  size: seconds,                    // how much work, so the estimate scales
+  maxSeconds: seconds + 240,        // past this it has hung: stop
 });
 // ...launch the engine...
 await slot.release(exitCode);
 ```
+
+**Give every Node job a `maxSeconds`.** The bash harnesses wrap each engine in
+`timeout`; nothing does that for a Node one, and an engine that finishes its
+work and never exits then holds the GPU until somebody notices. With
+`maxSeconds` the client ends the run itself, daemon or no daemon: it gives the
+slot back, kills everything it started, and exits 124. The daemon enforces the
+same number as a backstop (see "A run that hangs is killed" below).
+
+Three optional fields say things only the job knows:
+
+| Field (Node / wire) | Meaning |
+|---|---|
+| `size` / `size` | How much work this is, in whatever the job counts in — seconds to record, scenarios to shoot. The estimate is fitted to it. |
+| `maxSeconds` / `max_s` | The longest this may run once it starts. |
+| `idleOk` / `idle_ok` | A window that is meant to sit there. It will not be taken for a hang; `maxSeconds` still applies. |
 
 **Bash** — mfrs's `run_lib.sh` carries `testq_acquire` / `testq_release`, which
 speak the same protocol over `curl`.
@@ -97,9 +115,23 @@ The one rule in either language: acquire BEFORE any engine starts, including an
 import pass, and give the slot back when the last engine exits. A run that has
 to wait says so:
 
-    [testq] the box is busy -- queued at position 2 (waiting for slots).
+    [testq] the box is busy -- queued at position 2 (waiting for the GPU).
     [testq] nothing has launched yet; watch http://localhost:43117/
-    [testq] got the box after 184s -- starting
+    [testq] starts in ~12m.
+    [testq] if your command will time out before then, run it in the background; ...
+    [testq] got the box after 704s -- starting
+
+**The start time is rough, and it is there so you can decide.** It is one line
+of arithmetic over the estimates already on the tickets ahead. Anything ahead
+with no estimate turns it into "at least", and a job waiting on a mutex or on
+engines the queue did not start gets no figure at all, because nobody has one.
+
+**A ticket outlives its client, briefly.** A command with a ten-minute timeout
+in a twenty-minute queue used to lose its place and start again at the back —
+or give up and run outside the queue, which is worse for everybody. Now the
+same job (worktree, script, arg) asking again within fifteen minutes gets its
+waiting time back, which is what orders the queue and what ages a ticket to the
+front. Two live copies of one job are still two jobs.
 
 ### What the grant tells you back
 
@@ -134,9 +166,11 @@ records the exit code.
 ## The page
 
 **<http://localhost:43117/>** is the point of the thing: what is running, in
-which project and worktree, for how long against its estimate; what is queued
-and what it is waiting for; anything running outside the queue; and the last
-fifty jobs with their exit codes. Each row has a cancel button that really does
+which project and worktree, for how long against its estimate; what is queued,
+what it is waiting for and roughly when it starts; the engines running outside
+the queue, **by worktree**; and the last fifty jobs with their exit codes — a
+job the queue killed itself shows there in red, as `killed: stalled` or
+`killed: overran`. Each row has a cancel button that really does
 stop the work (see below). `python testq.py status` is the same thing in the
 terminal.
 
@@ -169,6 +203,17 @@ needs an estimate, and for anything with no `weights-*.json` entry — `run_mp`,
 clips, screenshots, captures, or any worktree that has not yet run the full
 suite — the estimate is the median of that job's own recent history, preferring
 this worktree's runs and falling back to every worktree's.
+
+That key — script and arg — is wrong for any job whose arg is not what decides
+how long it takes. `capture-warehouse.mjs warehouse` is 48 s recording thirty
+seconds and ten minutes recording five hundred. So a job with a **size** is
+estimated from a straight line through that script's recent runs of the same
+kind: a fixed cost plus so much a unit. The size is whatever the client sends
+in `size`, or the leading number of an arg written like `148 scenarios`. Two
+or more runs at exactly this size win over the line. And a job nothing else can
+estimate gets the median of its script with any argument, which is rough and
+still better than sorting behind everything: more than a quarter of all jobs
+used to arrive with no estimate at all.
 
 An older JSONL history file is imported once on first start and renamed to
 `history.jsonl.imported`; nothing measured is thrown away.
@@ -275,9 +320,12 @@ semaphore of size one would deadlock both on the first call.
 Queue order is **shortest first**, estimated from the `weights-<tree>.json` a
 suite writes, so a twenty-second tagged slice does not sit behind two
 eleven-minute suites. Nothing starves: a job that has waited longer than
-`max(600 s, 2× its own estimate)` ages to the front, and while a large job is
-at the head its unmet slots are reserved so a stream of small ones cannot keep
-it out. A job blocked only on the GPU still lets CPU-only work past it.
+`max(600 s, 2× its own estimate)` ages to the front (600 s flat for a job with
+no estimate yet), and while a large job is at the head its unmet slots are
+reserved so a stream of small ones cannot keep it out. A job blocked only on
+the GPU reserves no slot — whoever holds the GPU hands a slot back with it —
+and neither does anything further back in the GPU line, so CPU-only work goes
+past all of it.
 
 ### Flexible width
 
@@ -303,6 +351,17 @@ shard count off the grant. A job whose engine count is fixed must never send
 **It never launches or pools a Godot process.** A warm engine would show up in
 `run_mp`'s stray count and condemn every multiplayer run to INCONCLUSIVE
 forever.
+
+**The box is read straight from the kernel.** Counting engines used to be
+`tasklist`, and reading their command lines PowerShell and WMI: a second
+apiece, and on a loaded box WMI answers "Call cancelled" for minutes at a time.
+For those minutes the daemon counted no engines on a box carrying eight —
+the wrong direction to be wrong in, since it is what tells `run_mp` the box is
+quiet. It is now a Toolhelp snapshot and two reads of each engine's own memory
+(its command line and its working directory, which no Windows API reports), in
+about 25 ms. A look that fails keeps the last count instead of reading as zero.
+A parent pid is also checked against creation times, so a recycled number
+cannot put a stranger under a job's shell.
 
 **Engines it did not grant still count.** Worktrees without the client, and the
 editor, are real load. The daemon counts what is actually on the box, subtracts
@@ -339,6 +398,57 @@ command line instead would also match shells that merely mention the engine,
 and a blanket kill by image name is the failure this whole tool sits downstream
 of.
 
+**A run that hangs is killed, once it is in somebody's way.** Liveness only
+watches the shell, so an engine that finished its work and never exited used to
+hold its slots until someone noticed — a 48-second capture kept the GPU for two
+hours, with three jobs polling behind it and five more giving up. Being late is
+not enough to convict: the history has honest runs at fifty times their
+estimate, because the estimate is keyed on script and arg and a capture's arg
+does not say how long it was asked to record. So a lease past
+`max(600 s, 3× its estimate)` — 1800 s flat with no estimate — only becomes a
+suspect, and from then its processes are read once a minute. It is killed when
+the same set of pids has burned under half a core between them for five
+minutes **and** something is queued. A hung windowed engine idles at about a
+fifth of a core; a working one does not get under one. The history row says
+`stalled`, `daemon.log` says why, and `status` and the page show `idle 4m` on a
+run that is being watched. A hung run with nothing behind it is left alone, and
+so is one whose client sent `idle_ok`.
+
+Idle is not the only way to hang. A run spinning in a loop looks exactly like
+work, so there is also a **ceiling**: `max_s` if the client declared one,
+otherwise `max(3600 s, 4× its estimate)` — far past anything honest, the
+longest real run in three thousand being twenty minutes. Past it, with
+something queued, the run is killed whatever it is doing and the row says
+`overran`.
+
+Either way the owner is usually an agent that sees only a dead process, so the
+reason is kept for half an hour and handed to that worktree's next `acquire`,
+which prints it. The tray raises a balloon for it too.
+
+What is read, and what is killed, is the shell's process subtree plus the
+engines running out of the job's worktree. The second half is most of it for a
+bash client: Git-Bash's `timeout` has no living Windows parent, so
+`run_test.sh`'s engines are never under its shell and the subtree is one
+sleeping bash. Nothing the kill reaches was working — every engine it can match
+was in the reading that just came back idle.
+
+**An engine belongs to the innermost worktree it is under.** Worktrees nest:
+every mfrs worktree lives at `mfrs/.claude/worktrees/<name>`, inside the main
+checkout. Matching the worktree's leaf name in the engine's command line, which
+is what cancel used to do, made `mfrs` match all of them — cancelling a job in
+the main checkout would have killed every worktree's engines. The match is now
+on the normalised `--path`, and an engine below a `worktrees` directory inside
+a tree is not that tree's. Two jobs in **one** worktree cannot be told apart by
+path, so whatever sits under another running job's shell is spared; that covers
+a Node job beside anything, and two bash jobs in one worktree are still one
+pool of engines to a cancel. An engine started with a relative `--path`
+— every prognosticator harness uses `--path godot` — is placed by its working
+directory, which is read out of the process because nothing on Windows reports
+it. If that read fails the engine counts as activity for any job it might
+belong to, and is never killed by the sweep.
+
+A process table that cannot be read is skipped, not taken as idle.
+
 **Queue time is free.** Every outer `timeout` in the run scripts wraps only its
 engine invocation, and the engine-side watchdogs start with the engine, so a
 job that waits an hour still gets its full 1500 s. All blocking happens before
@@ -350,6 +460,15 @@ be started, the run goes ahead unqueued with a loud warning. Infrastructure
 that can stop you testing is worse than the contention it was built to prevent.
 
 ## Testing the queue itself
+
+    python -m unittest discover tests
+
+Sixty-odd tests, standard library only, a couple of seconds. They start no
+daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
+clock against a dictionary shaped like the process table, so a test can
+describe a hung Godot in one line and watch what the daemon does about it over
+twenty simulated minutes. Run them before `start --restart`.
+
 
 `run_mp.sh` in mfrs is the regression test. Its stray count and INCONCLUSIVE
 verdict were left exactly as they were; under a working queue it measures zero
