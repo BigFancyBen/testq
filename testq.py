@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """testq -- one queue for every Godot run on this machine.
 
-The problem this exists for: there is one box, one GPU and about four engines'
-worth of real capacity (measured -- see the header of mfrs's run_test_par.sh),
+The problem this exists for: there is one box, one GPU and eight slots' worth
+of admission (a policy, not a measured ceiling -- see CAPACITY below),
 but several projects and a couple of dozen worktrees between them, each of which
 thinks it is alone on it. Two sessions starting `run_test_par.sh 4` at the same
-moment put eight engines on four engines' worth of machine, and everything that
+moment put eight engines on a box neither of them measured, and everything that
 asserts against the wall clock starts flipping: generation budgets, warm-up
 budgets, and above all a multiplayer check whose whole verdict is a clock-skew
 measurement between two live processes. Those failures are indistinguishable
@@ -77,11 +77,13 @@ PROTO = 1
 # photographs.
 DEFAULT_PORT = 43117
 
-# Four. Not a guess: run_test_par.sh's header records 6 and 8 shards each
-# running 1.5-1.7x slower than 4 and finishing later overall, on this 24-core
-# box, because a single headless engine already drives several cores (runtime
-# mesh building and the physics step are both threaded).
-CAPACITY = {"cpu": 4, "gpu": 1}
+# Eight, and an admission policy rather than a measured ceiling. This was four
+# on the strength of run_test_par.sh's header, which had 6 and 8 shards each
+# running 1.5-1.7x slower than 4. Retaken under the queue on a quiet box that
+# did not survive: eight shards ran the mfrs suite 1.6x faster than four
+# (152 s -> 94 s), and the old slowdown was other worktrees' engines. The box
+# is 16 cores and 24 threads.
+CAPACITY = {"cpu": 8, "gpu": 1}
 
 # One GPU, and the windowed harnesses (run_shots, run_clip) are the only things
 # that want it.
@@ -111,6 +113,16 @@ AGE_FLOOR_SECONDS = 600.0
 # run_mp's own INCONCLUSIVE verdict is exactly the right thing to report if the
 # timing then trips, and it is better than never running the check at all.
 EXCLUSIVE_STRAY_PATIENCE = 300.0
+
+# An engine outside the queue docks a slot because it is load, and one that
+# finished its script and never exited is not. Twenty-three headless probes
+# left behind by one session, at no cpu at all for half an hour, docked every
+# slot on the box and held that same session's four queued jobs for sixteen
+# minutes. So an outside engine that has burned under this much of a core for
+# this long is listed and not counted. It counts again on the first reading
+# that shows it working.
+IDLE_STRAY_SECONDS = 120.0
+IDLE_STRAY_CORES = 0.1
 
 # A run whose engine finished its work and then never exited keeps its lease
 # for as long as its shell lives, and reap() only ever looks at the shell. A
@@ -919,6 +931,10 @@ class Queue(object):
         self.observed_at = 0.0
         self.stray = 0
         self.stray_prev = 0
+        # Outside engines doing nothing, which dock no capacity, and the cpu
+        # readings that say so: pid -> {"cpu", "at", "quiet_since"}.
+        self.stray_idle = 0
+        self.stray_samples = {}
         self.sha = ""
         self.port = DEFAULT_PORT
         # Whether the box was busy at the last tick, which is all the tray
@@ -1019,7 +1035,7 @@ class Queue(object):
         self.observed = seen
         self.outside = self.engines_outside(table)
         expected = sum(int(l.get("engines", 0)) for l in self.leases.values())
-        stray = max(0, self.observed - expected)
+        stray = max(0, self.observed - expected - self.stray_idle)
         # Two consecutive samples before we believe it. A single sample catches
         # the transient --import engine of a job that has a lease but has not
         # launched its real engines yet, and flapping capacity on that would
@@ -1033,20 +1049,24 @@ class Queue(object):
 
     def engines_outside(self, table):
         """The engines no running job accounts for, grouped by the worktree
-        they are running out of: [{"tree", "path", "engines"}], busiest first.
+        they are running out of: [{"tree", "path", "engines", "idle"}], busiest
+        first. Also settles self.stray_idle.
 
         "N unmanaged engines" was never enough to act on. Two thirds of all
         runs share the box with engines the queue did not start, and the only
         way to find out whose was to go and read command lines. This is not
         the number the scheduler docks capacity by -- that stays the plain
-        count over what was booked -- it is who to go and talk to.
+        count over what was booked, less the idle ones found here -- it is who
+        to go and talk to.
         """
         mine = set()
         for lease in self.leases.values():
             mine.update(subtree(table, int(lease.get("winpid") or 0)))
         trees = [l.get("tree_path") for l in self.leases.values()]
         groups = {}
-        for pid, (_, name, cmdline, _) in table.items():
+        samples = {}
+        self.stray_idle = 0
+        for pid, (_, name, cmdline, cpu) in table.items():
             if pid in mine or not is_engine(name):
                 continue
             if any(engine_of(pid, cmdline, tree) for tree in trees if tree):
@@ -1057,9 +1077,34 @@ class Queue(object):
                 project = norm_path(process_cwd(pid))
             label = tree_label(project) if project else "unknown"
             row = groups.setdefault(label, {"tree": label, "path": project,
-                                            "engines": 0})
+                                            "engines": 0, "idle": 0})
             row["engines"] += 1
+            samples[pid] = self.stray_sample(pid, cpu)
+            if self.stray_is_idle(samples[pid]):
+                row["idle"] += 1
+                self.stray_idle += 1
+        # Rebuilt each look, so a pid that has left takes its readings with it.
+        self.stray_samples = samples
         return sorted(groups.values(), key=lambda g: (-g["engines"], g["tree"]))
+
+    def stray_sample(self, pid, cpu):
+        """This look's reading of an outside engine, carrying forward how long
+        it has been quiet. Holds the lock."""
+        last = self.stray_samples.get(pid)
+        sample = {"cpu": cpu, "at": now(), "quiet_since": None}
+        # Cpu time only goes up; one that went down is a new process wearing
+        # an old pid, and starts again as unknown.
+        if last is None or cpu < last["cpu"]:
+            return sample
+        if now() <= last["at"]:
+            return last
+        if cpu - last["cpu"] < IDLE_STRAY_CORES * (now() - last["at"]):
+            sample["quiet_since"] = last["quiet_since"] or last["at"]
+        return sample
+
+    def stray_is_idle(self, sample):
+        since = sample.get("quiet_since")
+        return since is not None and now() - since >= IDLE_STRAY_SECONDS
 
     # -- the scheduler ----------------------------------------------------
 
@@ -1629,7 +1674,9 @@ class Queue(object):
                 max_s = float(max_s) if max_s else None
             except (TypeError, ValueError):
                 max_s = None
-            slots_val = max(0, int(body.get("slots", 1)))
+            # More than the whole box means the whole box. A client that
+            # remembers a bigger one would otherwise wait for ever.
+            slots_val = min(max(0, int(body.get("slots", 1))), self.capacity["cpu"])
             # A flexible job: "slots is what I want, slots_min is what I can
             # run on". 0 or absent means rigid, which is every job that runs
             # a fixed number of engines. Only a job whose engine count follows
@@ -1911,6 +1958,7 @@ class Queue(object):
                     "observed": self.observed,
                     "expected": sum(int(l.get("engines", 0)) for l in self.leases.values()),
                     "unmanaged": self.stray,
+                    "idle": self.stray_idle,
                     "outside": list(self.outside),
                 },
                 "running": running,
@@ -2170,17 +2218,22 @@ function render(s) {
     cap.gpu + " gpu, " + s.godot.observed + " engine(s) on the box";
   $("stamp").textContent = "updated " + new Date().toLocaleTimeString();
 
+  const idle = s.godot.idle || 0;
   $("banner").innerHTML = s.godot.unmanaged > 0
     ? '<div class="banner">' + s.godot.unmanaged + ' Godot engine(s) running outside the queue' +
       ' &mdash; capacity reduced to match. A worktree without the queue shim, or the editor.' +
+      (idle ? ' ' + idle + ' more sitting idle, not counted.' : '') +
       outside(s) + '</div>'
+    : idle > 0
+    ? '<div class="banner">' + idle + ' Godot engine(s) outside the queue sitting idle' +
+      ' &mdash; not counted against capacity, and probably hung.' + outside(s) + '</div>'
     : "";
 
   function outside(s) {
     const rows = s.godot.outside || [];
     if (!rows.length) return "";
     return "<br>" + rows.map(g => "<span class='mono'>" + esc(g.tree) + "</span> &times;" +
-      g.engines).join(", ");
+      g.engines + (g.idle ? " (" + g.idle + " idle)" : "")).join(", ");
   }
   function startsIn(q) {
     if (q.start_in_s == null) return "--";
@@ -2542,11 +2595,15 @@ def cmd_status(args):
         print("testq is not running on port %d" % port)
         return 1
     used, cap = state["used"], state["capacity"]
+    aside = []
+    if state["godot"]["unmanaged"]:
+        aside.append("%d unmanaged" % state["godot"]["unmanaged"])
+    if state["godot"].get("idle"):
+        aside.append("%d idle, not counted" % state["godot"]["idle"])
     print("testq  %d/%d cpu  %d/%d gpu  %d engine(s) on the box%s"
           % (used["cpu"], cap["cpu"], used["gpu"], cap["gpu"],
              state["godot"]["observed"],
-             "  (%d unmanaged)" % state["godot"]["unmanaged"]
-             if state["godot"]["unmanaged"] else ""))
+             "  (%s)" % ", ".join(aside) if aside else ""))
     for r in state["running"]:
         idle = ""
         if r.get("quiet_since"):
@@ -2565,8 +2622,9 @@ def cmd_status(args):
                  (q["script"] + " " + (q["arg"] or "")).strip(),
                  fmt_dur(q.get("waiting_s")), q.get("blocked_on", ""), starts))
     for g in state["godot"].get("outside", []):
-        print("  OUT   %-34s %d engine(s) not started by a running job"
-              % (g["tree"][:34], g["engines"]))
+        print("  OUT   %-34s %d engine(s) not started by a running job%s"
+              % (g["tree"][:34], g["engines"],
+                 "  (%d idle)" % g["idle"] if g.get("idle") else ""))
     if not state["running"] and not state["queued"]:
         print("  idle")
     return 0

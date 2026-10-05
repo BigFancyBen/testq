@@ -4,19 +4,20 @@ One queue for every Godot run on this machine, belonging to no project.
 
 ## Why
 
-There is one box, one GPU, and four slots' worth of admission — a slot being
-"a job's fair share of the machine", not a measured engine ceiling. (An older
-version of this paragraph cited mfrs's finding that six and eight shards ran
-1.5–1.7× slower than four; retaken under the queue on a quiet box, that
-measurement did not survive — eight shards run the same suite 1.6× faster
-than four, and the old slowdown was neighbouring worktrees, which is this
-tool's whole thesis. mfrs's `run_test_par.sh` now oversubscribes its four-slot
-booking with eight engines by design.) Against the four slots there are
+There is one box, one GPU, and eight slots' worth of admission — a slot being
+"a job's fair share of the machine", not a measured engine ceiling. (It was
+four, on mfrs's finding that six and eight shards ran 1.5–1.7× slower than
+four; retaken under the queue on a quiet box, that measurement did not
+survive — eight shards run the same suite 1.6× faster than four, and the old
+slowdown was neighbouring worktrees, which is this tool's whole thesis. The
+box is 16 cores and 24 threads. mfrs's `run_test_par.sh` books a slot a shard up to
+the capacity it reads from `/state`, so its default eight shards are the whole
+box; a booking wider than the box is clamped to it.) Against the eight slots there are
 several projects and a couple of dozen worktrees, each of which thinks it is
 alone on the machine.
 
 Two sessions starting `run_test_par.sh 4` in the same minute put eight engines
-on a four-engine box, and everything that asserts against the wall clock starts
+on a box neither of them measured, and everything that asserts against the wall clock starts
 flipping: the generation budget, `Sfx.warm()`, and above all `run_mp.sh`, whose
 whole verdict is a clock-skew measurement between two live processes. Those
 failures read exactly like real ones. Several of them have reached pull
@@ -369,6 +370,13 @@ what it granted, and docks capacity by the difference (debounced over two
 samples). That one rule also stops a restarted daemon from overgranting on top
 of the previous one's orphans, and it is why the page can show "2 unmanaged
 engines".
+
+**Unless they are doing nothing.** An outside engine that has burned under a
+tenth of a core for two minutes is listed as idle and docks no slot; it counts
+again on the first reading that shows it working. Twenty-three headless probes
+that finished their scripts and never exited once docked every slot on the box
+and held their own session's queued jobs for sixteen minutes. The daemon does
+not kill them — they are not its to kill — it only stops waiting for them.
 
 **Leader election is the port bind**, with `SO_EXCLUSIVEADDRUSE` set before
 bind. There is no lock file to go stale, and a second daemon exits quietly.

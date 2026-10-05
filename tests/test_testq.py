@@ -448,6 +448,39 @@ class Observed(Box):
             [(g["tree"], g["engines"]) for g in self.q.snapshot()["godot"]["outside"]],
             [("mfrs/hats", 2), ("prognosticator/mk64", 1)])
 
+    def test_an_idle_engine_outside_the_queue_stops_docking_slots(self):
+        for pid in range(30, 30 + testq.CAPACITY["cpu"]):
+            self.engine(pid, 997, WT_B)                    # finished, never exited
+        self.engine(60, 996, WT_A)                         # working
+        self.run_for(20, rates={60: 1.0})
+        suite = self.job(script="run_test.sh", tree=SNAP, winpid=100, gpu=0, slots=1)
+        self.assertFalse(self.running(suite))
+        self.run_for(testq.IDLE_STRAY_SECONDS, rates={60: 1.0})
+        self.assertTrue(self.running(suite))
+        self.engine(101, 100, SNAP)                        # the suite's own
+        self.run_for(10, rates={60: 1.0, 101: 1.0})
+        godot = self.q.snapshot()["godot"]
+        self.assertEqual((godot["unmanaged"], godot["idle"]),
+                         (1, testq.CAPACITY["cpu"]))
+        self.assertEqual(
+            [(g["tree"], g["engines"], g["idle"]) for g in godot["outside"]],
+            [("mfrs/hats", testq.CAPACITY["cpu"], testq.CAPACITY["cpu"]),
+             ("mfrs/weekend-features", 1, 0)])
+
+    def test_an_idle_engine_counts_again_once_it_works(self):
+        self.engine(30, 997, WT_B)
+        self.run_for(testq.IDLE_STRAY_SECONDS + 20)
+        self.assertEqual((self.q.stray, self.q.stray_idle), (0, 1))
+        self.run_for(10, rates={30: 1.0})
+        self.assertEqual((self.q.stray, self.q.stray_idle), (1, 0))
+
+    def test_a_recycled_pid_is_not_idle_on_the_old_ones_record(self):
+        self.engine(30, 997, WT_B, cpu=50.0)
+        self.run_for(testq.IDLE_STRAY_SECONDS + 20)
+        self.engine(30, 997, WT_B, cpu=0.0)
+        self.run_for(10)
+        self.assertEqual((self.q.stray, self.q.stray_idle), (1, 0))
+
 
 # ---------------------------------------------------------------------------
 # The queue
@@ -481,6 +514,12 @@ class Scheduling(Box):
         self.job(script="b.mjs", winpid=200)
         suite = self.job(script="run_test.sh", winpid=300, gpu=0)
         self.assertTrue(self.running(suite))
+
+    def test_a_booking_wider_than_the_box_is_the_whole_box(self):
+        suite = self.job(script="run_test_par.sh", winpid=100, gpu=0,
+                         slots=testq.CAPACITY["cpu"] + 4)
+        self.assertTrue(self.running(suite))
+        self.assertEqual(suite["slots"], testq.CAPACITY["cpu"])
 
     def test_a_dead_shell_gives_its_slots_back(self):
         first = self.job(winpid=100)

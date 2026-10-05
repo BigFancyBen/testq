@@ -192,7 +192,7 @@ async function startDaemon() {
  * @param {string} [job.arg]     the interesting argument, e.g. a scene name
  * @param {string} [job.project] registry key, for estimates and reap
  * @param {string} [job.treePath] the checkout this runs in (default: cwd)
- * @param {number} [job.slots]   CPU slots, of about four on this box
+ * @param {number} [job.slots]   CPU slots, of eight on this box
  * @param {number} [job.gpu]     1 if it opens a window
  * @param {number} [job.engines] engines alive at once
  * @param {boolean} [job.exclusive] wants a quiet box (timing measurements)
