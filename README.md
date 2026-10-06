@@ -1,12 +1,50 @@
 # testq
 
-One queue for every Godot run on a machine, belonging to no project.
+**One queue for every Godot run on a machine, belonging to no project.**
 
-A small daemon holds a fixed number of slots, and the scripts that launch a
-Godot engine — test suites, screenshot and clip harnesses, captures — ask it
-for one first. Several projects, a couple of dozen worktrees and the coding
-agents working in them can then share one machine without slowing each other
-into failures that look real.
+Run enough agents and worktrees on one box and your tests start failing for a
+reason that is in nobody's diff: the other eight engines. testq is a small
+daemon that holds the machine's slots, and the scripts that launch a Godot
+engine — test suites, screenshot and clip harnesses, captures — ask it for one
+first. Everything still runs; it just stops running on top of everything else.
+
+![The testq page: five jobs running across two projects, five queued with the reason each is waiting and roughly when it starts, and a recent run the queue killed because it had hung](docs/page.png)
+
+<sub>The page at `localhost:43117`, here on a demo daemon with staged jobs.</sub>
+
+- **Load failures stop looking like real ones.** Wall-clock assertions, frame
+  budgets and a two-process clock-skew check all flip on a crowded box, and the
+  log reads the same either way. Under the queue they get the machine they were
+  written for.
+- **It was faster, not slower.** The same suite at eight shards ran 1.6× faster
+  than at four once nothing else was allowed on the box beside it.
+- **Agents can see why they are waiting.** A queued run prints its position,
+  what it is blocked on and roughly when it starts, so a session can decide to
+  background the command instead of timing out and going round the queue.
+- **A hung engine does not hold the GPU all afternoon.** A run that is late,
+  idle and in somebody's way is killed, and its owner is told why on its next
+  run.
+- **Nothing to install.** One Python file, standard library only. The daemon
+  starts itself the first time anything asks for a slot, and a client that
+  cannot reach it runs anyway with a warning.
+
+```mermaid
+flowchart LR
+  subgraph game["game repo"]
+    A["main checkout<br/>run_test_par.sh"]
+    B["worktree: hats<br/>run_test.sh physics"]
+    C["worktree: netcode<br/>run_mp.sh"]
+  end
+  subgraph app["another project"]
+    D["worktree: mk64<br/>capture.mjs"]
+  end
+  A & B & C & D -- "acquire" --> Q{{"testq daemon<br/>8 slots · 2 GPU windows"}}
+  Q -- "granted: launch now" --> R["Godot engines<br/>on the box"]
+  Q -. "queued: position, reason, start time" .-> W["waits before<br/>launching anything"]
+  Q --- P["page · tray icon · testq.db history"]
+```
+
+## What it needs
 
 - **Windows only.** Processes are read through Win32 and the tray icon is
   PowerShell.
@@ -270,6 +308,8 @@ directories a project has named: a reaper that guesses where scratch lives is a
 reaper that deletes somebody's work.
 
 ## The tray icon
+
+![The five states of the tray icon: grey idle, blue running, amber waiting, purple unmanaged, red failed](docs/tray-icons.png)
 
 **There is nothing to start.** The icon appears in the notification area
 whenever the box is busy — any project, any worktree, whether the run was
