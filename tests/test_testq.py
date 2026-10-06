@@ -1,4 +1,4 @@
-﻿"""Tests for testq. Stdlib only, like the thing they test:
+"""Tests for testq. Stdlib only, like the thing they test:
 
     python -m unittest discover tests
 
@@ -26,11 +26,11 @@ import testq  # noqa: E402
 
 G = "Godot_v4.7-stable_win64.exe"
 GC = "Godot_v4.7-stable_win64_console.exe"
-MAIN = "C:/Users/Tango/Documents/projects/mfrs"
+MAIN = "C:/Users/dev/Documents/projects/mfrs"
 WT_A = MAIN + "/.claude/worktrees/weekend-features"
 WT_B = MAIN + "/.claude/worktrees/hats"
-SNAP = "C:/Users/Tango/AppData/Local/Temp/claude/scratch-wh/snap2"
-PROG = "C:/Users/Tango/Documents/projects/prognosticator/.claude/worktrees/mk64"
+SNAP = "C:/Users/dev/AppData/Local/Temp/claude/scratch-wh/snap2"
+PROG = "C:/Users/dev/Documents/projects/prognosticator/.claude/worktrees/mk64"
 
 
 class Box(unittest.TestCase):
@@ -147,7 +147,7 @@ class EngineInTree(unittest.TestCase):
         self.assertIs(self.place(SNAP.replace("/", "\\") + "\\godot", SNAP), True)
 
     def test_every_spelling_of_a_path_is_one_path(self):
-        msys = "/c/Users/Tango/Documents/projects/mfrs/.claude/worktrees/weekend-features/"
+        msys = "/c/Users/dev/Documents/projects/mfrs/.claude/worktrees/weekend-features/"
         self.assertIs(self.place(WT_A, msys), True)
         quoted = testq.engine_in_tree(G + ' --path "C:/My Stuff/p/godot" -x', "C:/My Stuff/p")
         self.assertIs(quoted, True)
@@ -163,7 +163,7 @@ class EngineInTree(unittest.TestCase):
         inside = PROG.replace("/", "\\") + "\\godot\\"
         self.assertIs(self.place("godot", PROG, inside), True)
         self.assertIs(self.place("godot", WT_A, inside), False)
-        whole_project = "C:/Users/Tango/Documents/projects/prognosticator"
+        whole_project = "C:/Users/dev/Documents/projects/prognosticator"
         self.assertIs(self.place("godot", whole_project, inside), False)
 
     def test_labels(self):
@@ -724,6 +724,33 @@ class Estimates(Box):
 # ---------------------------------------------------------------------------
 
 @unittest.skipUnless(os.name == "nt", "reads Windows process memory")
+class RequestAllowed(unittest.TestCase):
+    """Who may talk to the daemon: its clients and its own page, not a
+    website that happens to be open in the browser on the same machine."""
+
+    def test_clients_send_a_loopback_host_and_no_origin(self):
+        for host in ("127.0.0.1:43117", "localhost:43117", "[::1]:43117",
+                     "LOCALHOST:43117", "127.0.0.1", None, ""):
+            self.assertTrue(testq.request_allowed(host, None, 43117), host)
+
+    def test_the_page_may_post_to_itself(self):
+        for origin in ("http://localhost:43117", "http://127.0.0.1:43117"):
+            self.assertTrue(
+                testq.request_allowed("localhost:43117", origin, 43117), origin)
+
+    def test_another_site_may_not(self):
+        for origin in ("https://example.com", "null", "",
+                       "http://localhost:3000", "http://localhost:43117.example.com"):
+            self.assertFalse(
+                testq.request_allowed("127.0.0.1:43117", origin, 43117), origin)
+
+    def test_a_rebound_name_may_not(self):
+        for host in ("example.com:43117", "example.com", "127.0.0.1.example.com:43117"):
+            self.assertFalse(testq.request_allowed(host, None, 43117), host)
+            self.assertFalse(
+                testq.request_allowed(host, "http://" + host, 43117), host)
+
+
 class RealProcessTable(unittest.TestCase):
     def test_this_process_is_in_it(self):
         table = testq.process_table()

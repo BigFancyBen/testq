@@ -1,6 +1,26 @@
 # testq
 
-One queue for every Godot run on this machine, belonging to no project.
+One queue for every Godot run on a machine, belonging to no project.
+
+A small daemon holds a fixed number of slots, and the scripts that launch a
+Godot engine — test suites, screenshot and clip harnesses, captures — ask it
+for one first. Several projects, a couple of dozen worktrees and the coding
+agents working in them can then share one machine without slowing each other
+into failures that look real.
+
+- **Windows only.** Processes are read through Win32 and the tray icon is
+  PowerShell.
+- **Godot 4**, spotted by image name (`TESTQ_GODOT_MATCH`).
+- **Python 3, standard library only.** The Node client needs Node 18 or later.
+- **Built for one machine and published as it is.** Capacity is a constant near
+  the top of `testq.py` (`CAPACITY`: eight slots, two windows on the GPU), sized
+  for a 16-core box with one card. Change it for yours.
+
+The examples throughout name `mfrs`, a Godot game, and `prognosticator`, a DJ
+visuals app. They are the two private projects this was built for, and their
+run scripts (`run_test.sh`, `run_lib.sh`, `capture-warehouse.mjs` and the rest)
+are not in this repository. Read them as worked examples of what a client looks
+like, not as things to go and find.
 
 ## Why
 
@@ -35,17 +55,20 @@ box, and neither repo can see the other's. A queue living inside one of them can
 only manage half the load — and the half it cannot see is exactly where the
 damage came from: prognosticator's capture script used to clear the box with
 `taskkill /IM Godot....exe`, which killed every engine in every mfrs worktree
-too, and at that end it read as a crashed test run with no error in it
-(prognosticator issue #9).
-
-This copy started as mfrs's `tools/testq/` and is byte-identical to it apart
-from the changes listed in [UPSTREAM.md](UPSTREAM.md) — all of which are about
-not being one project's tool any more.
+too, and at that end it read as a crashed test run with no error in it.
 
 ## Install
 
-Nothing to install: Python 3, standard library only, and the daemon autostarts
-the first time a client asks for it.
+Clone it; there is nothing else to install, and the daemon autostarts the first
+time a client asks for it.
+
+    git clone https://github.com/BigFancyBen/testq.git
+
+A client only has to find `testq.py` when it is the one starting the daemon.
+The Node client looks at `TESTQ_PY`, then for a `_tools/testq/testq.py` beside
+any directory above the one it was run from — so cloning into
+`<projects>/_tools/testq` works with no configuration, and anywhere else works
+with `TESTQ_PY` set.
 
     python testq.py start             # usually unnecessary
     python testq.py start --restart   # after editing testq.py
@@ -57,18 +80,16 @@ the first time a client asks for it.
     python -m unittest discover tests # the queue's own tests; starts nothing
 
 State, the history database and the daemon's own snapshot live in
-`%LOCALAPPDATA%\testq\` — or in `%LOCALAPPDATA%\mfrs-testq\` when that older
-directory exists, which on this box it does. Keep it that way: that directory
-holds every run this machine has recorded, and the scheduler's estimates are
-medians drawn from it. `TESTQ_HOME` overrides.
+`%LOCALAPPDATA%\testq\`. `TESTQ_HOME` overrides. (An older
+`%LOCALAPPDATA%\mfrs-testq\` is used instead when it exists, so a machine that
+ran the tool under its first name keeps its history; see "History" at the end.)
 
-mfrs is losing its vendored copy in its PR #94, which points `run_lib.sh` here.
-Until that merges there are two copies of `testq.py` on the box and either can
-win the port bind — harmless, because they share the runtime directory and the
-protocol, though only this one raises the tray icon. Keep this one running (a
-shortcut to `testq.py start` in `shell:startup` is enough) and mfrs will never
-spawn its own: its client only autostarts a daemon when nothing answers on the
-port.
+The daemon listens on 127.0.0.1 only, and refuses any request that does not
+come from this machine's own clients or its own page: a `Host` that is not
+loopback, or an `Origin` that is not the daemon's. That second half is for the
+browser — without it any website open on the machine could POST to `/cancel`.
+There is no authentication beyond that, so every local user and process can
+queue and cancel.
 
 ## Using it from a project
 
@@ -110,8 +131,10 @@ Three optional fields say things only the job knows:
 | `maxSeconds` / `max_s` | The longest this may run once it starts. |
 | `idleOk` / `idle_ok` | A window that is meant to sit there. It will not be taken for a hang; `maxSeconds` still applies. |
 
-**Bash** — mfrs's `run_lib.sh` carries `testq_acquire` / `testq_release`, which
-speak the same protocol over `curl`.
+**Bash** — there is no bash client in this repository yet. The one in use is
+mfrs's `run_lib.sh`, whose `testq_acquire` / `testq_release` speak the same
+protocol over `curl`; `clients/testq.mjs` is the reference for what to send
+(`POST /acquire`, long-poll `POST /wait`, `POST /release`, all JSON).
 
 The one rule in either language: acquire BEFORE any engine starts, including an
 import pass, and give the slot back when the last engine exits. A run that has
@@ -229,13 +252,13 @@ has run the same job twice.
 ```json
 {
   "mfrs": {
-    "root": "C:/Users/Tango/Documents/projects/mfrs",
+    "root": "C:/Users/dev/Documents/projects/mfrs",
     "userdata": "%APPDATA%/Godot/app_userdata/Middle Fork River Slop",
     "scratch": "%TEMP%/mfrs",
     "scratch_subdirs": ["clips", "shots"],
     "weights": "test"
   },
-  "prognosticator": { "root": "C:/Users/Tango/Documents/projects/prognosticator" }
+  "prognosticator": { "root": "C:/Users/dev/Documents/projects/prognosticator" }
 }
 ```
 
@@ -276,9 +299,7 @@ something else is running.
 is there for when you want it up regardless: an icon asked for by hand stays
 until it is dismissed, which is also true of "Hide this icon" on its menu —
 dismiss it mid-run and it stays gone until the queue has gone quiet and come
-back. There is no need for a `shell:startup` shortcut any more, though one is
-still the surest way to make this install, rather than a project's vendored
-copy, the daemon that ends up serving.
+back. There is no need for a `shell:startup` shortcut.
 
 It is a PowerShell script (`tray.ps1`) using the tray API Windows already has,
 not an Electron app. Everything the tray needs to do — sit in the overflow
@@ -485,7 +506,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-Sixty-odd tests, standard library only, a couple of seconds. They start no
+Eighty tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
@@ -496,3 +517,20 @@ twenty simulated minutes. Run them before `start --restart`.
 verdict were left exactly as they were; under a working queue it measures zero
 and never fires. An INCONCLUSIVE from a queued run means the queue let something
 through.
+
+## History
+
+testq started as `tools/testq/` inside mfrs and was lifted out when a second
+project turned out to be half the load. That is where the remaining traces of
+the old name come from, and they are deliberate: the legacy runtime directory
+`%LOCALAPPDATA%\mfrs-testq` is still honoured so accumulated run history is
+not thrown away, and `tray.ps1` keeps `mfrs-testq-tray-<port>` as its mutex so
+an old vendored tray and this one still exclude each other. What changed on
+the way out — `projects.json`, the `project` field, the Node client, the tray
+raised by the daemon, self-rescue of hung runs, reading the process table
+without WMI, the tests — is in the commit log. None of it changed the wire
+protocol, which is still `PROTO` 1.
+
+## License
+
+[MIT](LICENSE).

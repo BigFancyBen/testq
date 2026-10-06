@@ -1,8 +1,8 @@
 /**
  * testq client for Node projects. Ask before you launch an engine.
  *
- * The canonical copy of this file lives in the testq install
- * (`_tools/testq/clients/testq.mjs`). Projects VENDOR it rather than importing
+ * The canonical copy of this file lives in the testq repository
+ * (`clients/testq.mjs`). Projects VENDOR it rather than importing
  * it across an absolute path, so a checkout stays self-contained and still
  * builds on a machine that has never heard of testq — where every call here
  * turns into a warning and the work goes ahead unqueued. Copy it in; if you

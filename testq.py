@@ -1978,6 +1978,34 @@ class Queue(object):
 # HTTP
 # ---------------------------------------------------------------------------
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def request_allowed(host, origin, port):
+    """Whether a request came from this machine's own clients or its own page.
+
+    Binding to 127.0.0.1 keeps other machines out and does nothing about the
+    browser already on this one: any page it has open can POST here, and
+    /cancel and /quit kill things. A browser always says where a cross-site
+    request came from, so an Origin that is not this daemon's own page is
+    refused. The Host check is for DNS rebinding, where a hostile name is
+    pointed at 127.0.0.1 so that the page reading /state IS same-origin -- it
+    still has to send its own name as Host. curl, urllib and Node send no
+    Origin and a loopback Host, which is every real client there is.
+    """
+    host = (host or "").strip().lower()
+    if host:
+        name, sep, tail = host.rpartition(":")
+        if not sep or not tail.isdigit():
+            name = host
+        if name not in LOOPBACK_HOSTS:
+            return False
+    if origin is None:
+        return True
+    origin = origin.strip().lower()
+    return origin in ["http://%s:%d" % (h, port) for h in LOOPBACK_HOSTS]
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "testq/1"
     queue = None
@@ -1985,6 +2013,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass  # daemon.log is for crashes, not for a line per poll
+
+    def _refused(self):
+        if request_allowed(self.headers.get("Host"), self.headers.get("Origin"),
+                           self.server.server_address[1]):
+            return False
+        self._send(403, {"error": "not from this machine"})
+        return True
 
     def _send(self, code, payload, content_type="application/json"):
         if isinstance(payload, (dict, list)):
@@ -2014,6 +2049,8 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
+        if self._refused():
+            return None
         path = urlparse(self.path).path
         if path == "/healthz":
             return self._send(200, "ok", "text/plain")
@@ -2027,6 +2064,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "no such path"})
 
     def do_POST(self):
+        if self._refused():
+            return None
         path = urlparse(self.path).path
         body = self._body()
         if path == "/acquire":
