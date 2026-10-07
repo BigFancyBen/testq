@@ -1,32 +1,51 @@
 # testq
 
-**One queue for every Godot run on a machine, belonging to no project.**
+**Stop losing hours to test failures that nobody caused.**
 
-Run enough agents and worktrees on one box and your tests start failing for a
-reason that is in nobody's diff: the other eight engines. testq is a small
-daemon that holds the machine's slots, and the scripts that launch a Godot
-engine — test suites, screenshot and clip harnesses, captures — ask it for one
-first. Everything still runs; it just stops running on top of everything else.
+Put a dozen AI agents to work on one computer and they all run their tests at
+the same moment. The machine chokes, tests fail for reasons that are in
+nobody's code, and people and agents alike burn time chasing bugs that were
+never there. testq makes every run take its turn.
 
 ![The testq page: five jobs running across two projects, five queued with the reason each is waiting and roughly when it starts, and a recent run the queue killed because it had hung](docs/page.png)
 
-<sub>The page at `localhost:43117`, here on a demo daemon with staged jobs.</sub>
+<sub>The live view of the machine: what is running, what is waiting, and why.</sub>
 
-- **Load failures stop looking like real ones.** Wall-clock assertions, frame
-  budgets and a two-process clock-skew check all flip on a crowded box, and the
-  log reads the same either way. Under the queue they get the machine they were
-  written for.
-- **It was faster, not slower.** The same suite at eight shards ran 1.6× faster
-  than at four once nothing else was allowed on the box beside it.
-- **Agents can see why they are waiting.** A queued run prints its position,
-  what it is blocked on and roughly when it starts, so a session can decide to
-  background the command instead of timing out and going round the queue.
-- **A hung engine does not hold the GPU all afternoon.** A run that is late,
-  idle and in somebody's way is killed, and its owner is told why on its next
-  run.
-- **Nothing to install.** One Python file, standard library only. The daemon
-  starts itself the first time anything asks for a slot, and a client that
-  cannot reach it runs anyway with a warning.
+### The problem
+
+- **An overloaded machine fails tests that are fine.** And the failure looks
+  identical to a real one. Nothing in the log says "the box was busy".
+- **Those false alarms are expensive.** Someone has to investigate each one.
+  Several of ours made it into pull requests before anybody realised the code
+  had never been broken.
+- **More agents make it worse, not better.** Each one believes it has the
+  machine to itself, so every agent you add makes all the others less reliable.
+- **No single project can fix it.** The crowding comes from all of them at
+  once, and none of them can see the others.
+
+### What testq gives you
+
+- **Results you can believe.** A test runs on the machine it was written for,
+  so a failure means the code is wrong and a pass means it is right.
+- **Work that finishes sooner.** Taking turns beat piling on: the same test
+  suite ran 1.6× faster once nothing else was allowed to crowd it.
+- **No waiting in the dark.** Anything queued is told its place in line, what
+  it is waiting for and roughly when it will start.
+- **One stuck job cannot hold everyone up.** A run that has frozen while
+  others wait behind it is cleared out, and its owner is told what happened.
+- **Interruptions only when they matter.** You hear about a crash or a hang.
+  You do not hear about every test an agent is in the middle of fixing.
+- **Upgrades that interrupt nobody.** A new version takes over from the old
+  one mid-flight. Running jobs carry on and the line keeps its order.
+- **Nothing to set up.** One file, no installation. It starts itself the first
+  time it is needed, and if it is ever unavailable the work goes ahead anyway.
+
+### In one sentence, for engineers
+
+A small daemon holds the machine's slots, and every script that launches a
+Godot engine — test suites, screenshot and clip harnesses, captures — asks it
+for one first. It belongs to no project, because the contention does not
+either.
 
 ```mermaid
 flowchart LR
@@ -109,7 +128,7 @@ any directory above the one it was run from — so cloning into
 with `TESTQ_PY` set.
 
     python testq.py start             # usually unnecessary
-    python testq.py start --restart   # after editing testq.py
+    python testq.py start --restart   # after editing testq.py; interrupts nothing
     python testq.py status
     python testq.py stats --days 7
     python testq.py stop [--force]
@@ -219,12 +238,26 @@ same job (worktree, script, arg) asking again within fifteen minutes gets its
 waiting time back, which is what orders the queue and what ages a ticket to the
 front. Two live copies of one job are still two jobs.
 
-**So does a restart of the daemon.** `start --restart` keeps the running jobs
-and forgets the queue, and every queued client finds that out on its next poll
-and asks again — both clients do; the Node one used to run unqueued instead,
-which put the whole queue on the box in the same second. The places are saved
-with the leases and handed back the same way a dead client's is, so the queue
-comes back in the order it was in.
+**A restart of the daemon loses nobody's place, because it is not a restart.**
+`start --restart` starts the new daemon beside the old one and the old one
+hands it everything: the running jobs, the queue with every ticket under the
+id its client is polling for, and the listening socket itself, duplicated into
+the new process. The port is never closed. A long poll in flight comes back
+"still queued", the client asks again as it always does, and the daemon that
+answers is the new one; a run that asks for a slot in the middle waits a few
+hundred milliseconds in the socket's backlog and is answered. No process the
+queue started is touched, and no client needs to know — the wire is what it
+was. If any step fails the old daemon carries on and `start` says so.
+
+It used to stop one daemon and start another. Running jobs came through that,
+but the queue was forgotten and every client asked again, and for the second
+or two with nothing on the port a run that asked either started a daemon of
+its own from whatever copy of `testq.py` it could find or ran unqueued. With
+a dozen agents relying on the queue, changing this file meant picking a moment.
+That path is still there for the two cases that need it: a daemon that has
+died (the places are saved with the leases and handed back the same way a dead
+client's is), and the one restart that replaces a daemon from before this,
+which cannot hand over and wants `--force` if it has live jobs.
 
 ### What the grant tells you back
 
@@ -415,9 +448,17 @@ the daemon raises the icon.
 Hover for a one-line summary, left-click to open the page, right-click for the
 running and queued jobs in full. The icon itself is the status: grey idle, blue
 running, amber something waiting, purple engines on the box that the queue did
-not start, red if the last job to finish did not pass — and a balloon when one
-fails. The linger after the queue empties is what leaves that red dot and its
-balloon on screen long enough to be read.
+not start, red if the last job to finish did not pass. The linger after the
+queue empties is what leaves that red dot on screen long enough to be read.
+
+**A balloon is for a run that never got to give a verdict**: one the queue
+killed, or one whose engine crashed (an NTSTATUS exit such as `0xC0000005`, or
+a `SIGSEGV` through bash). A test that fails does not raise one. It did, and
+with agents iterating in a dozen worktrees that was 482 balloons in a day,
+nearly all of them a test correctly saying no to a change still being worked
+on — its owner already had the output, and the handful that were an engine
+dying were lost among them. The page names the same runs `crashed: access violation`
+where it used to say `exit 3221225477`.
 
 Windows 11 files new icons under the overflow chevron by default. Drag it onto
 the taskbar to see it without opening the chevron — Windows remembers that
@@ -668,7 +709,8 @@ A hundred and five tests, standard library only, a couple of seconds. They start
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
-twenty simulated minutes. Run them before `start --restart`.
+twenty simulated minutes. Run them before `start --restart`: a handover
+carries the queue across, and into whatever the new code does with it.
 
 
 `run_mp.sh` in mfrs is the regression test. Its stray count and INCONCLUSIVE

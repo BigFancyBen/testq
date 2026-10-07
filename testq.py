@@ -48,8 +48,10 @@ Subcommands:
 Tests: `python -m unittest discover tests`. They start nothing.
 """
 
+import base64
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -106,6 +108,50 @@ HISTORY_KEEP = 200
 # red dot and its balloon on screen long enough to be read, and vanishing the
 # instant the last slot came back would hide exactly the run worth noticing.
 TRAY_IDLE_LINGER = 90.0
+
+# What the tray raises a balloon for. It was every exit that was not 0, and on
+# 6 October that was 482 of them: an agent tuning a camera test ran it red
+# nine times in a row on the way to green, and each one came up on the
+# desktop as "failed". A test that says no is the test working, and its owner
+# has the output in front of it. So a balloon is for the run that never got to
+# give a verdict -- killed here, or an engine that died under it -- and an
+# ordinary failure is the red dot and a line on the page.
+#
+# A crash is read from the exit code, which is all there is: an NTSTATUS error
+# from a Windows process, or 128 plus the signal from one that bash waited on.
+# Ctrl+C is in the NTSTATUS error range and is somebody stopping a run.
+NTSTATUS_ERROR = 0xC0000000
+NTSTATUS_CONTROL_C = 0xC000013A
+NTSTATUS_NAMES = {
+    0xC0000005: "access violation",
+    0xC000001D: "illegal instruction",
+    0xC0000094: "divide by zero",
+    0xC00000FD: "stack overflow",
+    0xC0000135: "a DLL is missing",
+    0xC0000142: "a DLL failed to load",
+    0xC0000374: "heap corruption",
+    0xC0000409: "abort",
+}
+# Not 137 or 143: those are somebody's kill, and 124 to 127 are timeout(1) and
+# the shell failing to start the thing at all.
+CRASH_SIGNALS = {132: "SIGILL", 134: "SIGABRT", 135: "SIGBUS", 136: "SIGFPE",
+                 139: "SIGSEGV"}
+
+
+def alert_for(exit_code, verdict):
+    """What to interrupt somebody with about a finished run, or ""."""
+    if verdict in ("stalled", "overran"):
+        return "killed: " + verdict
+    if verdict != "released" or isinstance(exit_code, bool) \
+            or not isinstance(exit_code, int):
+        return ""
+    # A client that read the code as signed sends the same crash negative.
+    code = exit_code & 0xFFFFFFFF
+    if code >= NTSTATUS_ERROR and code != NTSTATUS_CONTROL_C:
+        return "crashed: %s" % NTSTATUS_NAMES.get(code, "0x%08X" % code)
+    if exit_code in CRASH_SIGNALS:
+        return "crashed: %s" % CRASH_SIGNALS[exit_code]
+    return ""
 
 # A job with no estimate sorts as if it were long, so an unknown never jumps a
 # known-short one.
@@ -188,6 +234,14 @@ PARK_SECONDS = 900.0
 # What a job that was killed here is told the next time its worktree asks for
 # anything, for this long. The kill itself cannot say: its reader is dead.
 NOTE_SECONDS = 1800.0
+
+# Replacing the daemon without anybody noticing: see Handover, below. The old daemon
+# gives requests already in its hands this long to finish before it lets go --
+# all but a cancel are over in milliseconds, and a cancel is a kill of several
+# passes -- and the new one this long to say it has everything. Past either,
+# the old daemon carries on as if nobody had asked.
+HANDOVER_DRAIN_SECONDS = 20.0
+HANDOVER_CONFIRM_SECONDS = 15.0
 
 STILL_ACTIVE = 259
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -982,7 +1036,7 @@ def arg_size(arg, size=None):
 # ---------------------------------------------------------------------------
 
 class Queue(object):
-    def __init__(self, capacity=None):
+    def __init__(self, capacity=None, inherited=None):
         self.lock = threading.RLock()
         self.changed = threading.Condition(self.lock)
         self.capacity = dict(capacity or CAPACITY)
@@ -1022,7 +1076,18 @@ class Queue(object):
         # Whether the box was busy at the last tick, which is all the tray
         # needs: the icon is raised on the edge into busy, not held up by us.
         self.was_busy = False
-        self.load_state()
+        # A handover to the daemon replacing this one (see Handover, below).
+        # `handing_over` while it lets go: long polls come back, no tick
+        # starts. `handed_over` once the state has gone: nothing here may
+        # change or be saved again, because it is no longer ours. It waits
+        # for a tick to finish first (`ticking`), which kills outside the lock.
+        self.handing_over = False
+        self.handed_over = False
+        self.ticking = False
+        if inherited is None:
+            self.load_state()
+        else:
+            self.adopt_state(inherited)
         self.load_history()
 
     # -- persistence ------------------------------------------------------
@@ -1057,7 +1122,57 @@ class Queue(object):
             except (TypeError, ValueError):
                 continue
 
+    def export_state(self):
+        """Everything a daemon taking over from this one needs to carry on as
+        if it were this one. Holds the lock.
+
+        Unlike state.json this has the queue in it, tickets and all: the
+        clients behind them are still polling for those ids, and the daemon
+        that answers the next poll has to know them. It has the readings too
+        -- how long a lease or a stray has sat idle -- which a restart rightly
+        throws away and a handover a second long has no reason to.
+        """
+        return {
+            "seq": self.seq,
+            "leases": list(self.leases.values()),
+            "queue": list(self.queue),
+            "cancelled": sorted(self.cancelled),
+            "parked": [list(key) + list(parked)
+                       for key, parked in self.parked.items()],
+            "notes": [[tree, text, at] for tree, (text, at) in self.notes.items()],
+            "stall_samples": self.stall_samples,
+            "stray_samples": self.stray_samples,
+            "outside_logged": self.outside_logged,
+            "was_busy": self.was_busy,
+        }
+
+    def adopt_state(self, blob):
+        """Take up where the daemon that sent export_state() left off."""
+        for lease in blob.get("leases", []):
+            self.leases[lease["id"]] = lease
+            for key in lease.get("mutexes", []):
+                self.held_mutex[key] = lease["id"]
+        self.queue = list(blob.get("queue", []))
+        self.seq = int(blob.get("seq", 0))
+        self.cancelled = set(blob.get("cancelled", []))
+        for tree, script, arg, enqueued_at, left, waits in blob.get("parked", []):
+            self.parked[(tree, script, arg)] = (enqueued_at, left, dict(waits))
+        for tree, text, at in blob.get("notes", []):
+            self.notes[tree] = (text, at)
+        # JSON has turned every pid these are keyed by into a string.
+        for lease_id, sample in blob.get("stall_samples", {}).items():
+            self.stall_samples[lease_id] = {
+                "at": sample["at"],
+                "cpu": dict((int(pid), cpu) for pid, cpu in sample["cpu"].items())}
+        self.stray_samples = dict(
+            (int(pid), sample) for pid, sample in blob.get("stray_samples", {}).items())
+        self.outside_logged = blob.get("outside_logged", "")
+        # So that the tray is not raised again for a box that was busy already.
+        self.was_busy = bool(blob.get("was_busy"))
+
     def save_state(self):
+        if self.handed_over:
+            return
         blob = {
             "seq": self.seq,
             "saved_at": now(),
@@ -1209,6 +1324,18 @@ class Queue(object):
 
     def tick(self):
         """Reap the dead, recount the box, grant what fits. Holds the lock."""
+        with self.lock:
+            if self.handing_over:
+                return False
+            self.ticking = True
+        try:
+            return self.tick_once()
+        finally:
+            with self.lock:
+                self.ticking = False
+                self.changed.notify_all()
+
+    def tick_once(self):
         with self.lock:
             self.refresh_observed()
             self.reap()
@@ -2080,7 +2207,10 @@ class Queue(object):
                     return {"granted": False, "unknown": True}
                 ticket["last_poll"] = now()
                 remaining = deadline - now()
-                if remaining <= 0:
+                # A daemon handing over answers what it has in hand, and
+                # "still queued" is true: the client asks again and the
+                # daemon that has taken over knows the ticket.
+                if remaining <= 0 or self.handing_over:
                     order = self.order()
                     position = order.index(ticket) + 1 if ticket in order else 0
                     start_in, floor = self.start_in(ticket, order)
@@ -2190,7 +2320,8 @@ class Queue(object):
                 },
                 "running": running,
                 "queued": queued,
-                "history": list(reversed(self.history[-50:])),
+                "history": [dict(row, alert=alert_for(row.get("exit"), row.get("verdict")))
+                            for row in reversed(self.history[-50:])],
             }
 
 
@@ -2295,6 +2426,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "testq/1"
     queue = None
     stopping = None
+    # A connection that never sends its request -- a browser opens them ahead
+    # of need -- is dropped after this long, where it used to hold a thread
+    # for ever. It would hold up a handover for as long too.
+    timeout = 5
 
     def log_message(self, fmt, *args):
         pass  # daemon.log is for crashes, not for a line per poll
@@ -2341,7 +2476,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "ok", "text/plain")
         if path == "/version":
             return self._send(200, {"proto": PROTO, "sha": self.queue.sha,
-                                    "started": self.queue.started})
+                                    "started": self.queue.started,
+                                    # For `start --restart`: whether this
+                                    # daemon can be replaced without being
+                                    # stopped, and how to tell it has been.
+                                    "handover": can_hand_over(),
+                                    "pid": os.getpid()})
         if path == "/state":
             return self._send(200, self.queue.snapshot())
         if path in ("/", "/index.html"):
@@ -2353,6 +2493,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         path = urlparse(self.path).path
         body = self._body()
+        if path == "/handover":
+            return self._handover(body)
+        if self.queue.handed_over:
+            # Cannot happen -- a handover waits for every connection this
+            # daemon accepted -- and must not be answered from a queue that
+            # is no longer ours if it ever does.
+            return self._send(503, {"error": "handed over"})
         if path == "/acquire":
             if int(body.get("proto", 0)) != PROTO:
                 return self._send(409, {
@@ -2384,6 +2531,70 @@ class Handler(BaseHTTPRequestHandler):
             self.stopping.set()
             return None
         return self._send(404, {"error": "no such path"})
+
+    def _handover(self, body):
+        """The old daemon's half of a handover, on the connection the new one
+        opened and keeps open until it is over."""
+        queue = self.queue
+        try:
+            pid = int(body.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if not can_hand_over() or pid <= 0:
+            return self._send(400, {"error": "no handover here"})
+        with queue.lock:
+            if queue.handing_over:
+                return self._send(409, {"error": "already handing over"})
+            queue.handing_over = True
+            queue.changed.notify_all()
+        # Stop taking connections. They are not refused: the socket goes on
+        # listening, and whoever connects from here on waits in its backlog for
+        # the new daemon to accept them.
+        self.server.shutdown()
+        blob = None
+        deadline = time.monotonic() + HANDOVER_DRAIN_SECONDS
+        # Everything accepted before that is answered first, this request
+        # excepted, and a tick is let finish: it kills outside the lock.
+        drained = self.server.wait_in_hand(1, deadline)
+        with queue.lock:
+            while drained and queue.ticking and time.monotonic() < deadline:
+                queue.changed.wait(0.25)
+            if drained and not queue.ticking:
+                queue.handed_over = True
+                blob = queue.export_state()
+        took = False
+        if blob is not None:
+            try:
+                share = self.server.socket.share(pid)
+                self._send(200, {"state": blob,
+                                 "socket": base64.b64encode(share).decode("ascii")})
+                # The new daemon says K when it holds the socket and the
+                # state, and serves only once it has D back. Anything else --
+                # it died, it took too long -- and this daemon was never
+                # replaced. Exactly one of the two is ever accepting.
+                self.connection.settimeout(HANDOVER_CONFIRM_SECONDS)
+                took = self.rfile.read(1) == b"K"
+            except Exception as exc:
+                sys.stderr.write("handover failed: %r\n" % (exc,))
+        if took:
+            sys.stderr.write("handed over to pid %d: %d running, %d queued\n"
+                             % (pid, len(blob["leases"]), len(blob["queue"])))
+            sys.stderr.flush()
+            try:
+                self.wfile.write(b"D")
+            except Exception:
+                pass
+            self.stopping.set()
+            return None
+        sys.stderr.write("handover to pid %d did not complete -- carrying on\n" % pid)
+        sys.stderr.flush()
+        with queue.lock:
+            queue.handing_over = queue.handed_over = False
+        threading.Thread(target=self.server.serve_forever,
+                         kwargs={"poll_interval": 0.5}, daemon=True).start()
+        if blob is None:
+            self._send(503, {"error": "busy"})
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2568,13 +2779,14 @@ function render(s) {
     '<th>Took</th><th>Queued</th><th>Peak engines</th><th>When</th></tr>' +
     s.history.map(h => {
       let cls = "exitx", txt = h.verdict;
-      if (h.verdict === "released") {
+      if (h.alert) {
+        // Killed here, by us, or an engine that died. Not a test saying no,
+        // and "exit 3221225477" does not tell anybody that.
+        cls = "exit1";
+        txt = h.alert;
+      } else if (h.verdict === "released") {
         cls = h.exit === 0 ? "exit0" : h.exit === 2 ? "exit2" : "exit1";
         txt = h.exit === 0 ? "pass" : "exit " + h.exit;
-      } else if (h.verdict === "stalled" || h.verdict === "overran") {
-        // Killed here, by us. That is a failure somebody should read about.
-        cls = "exit1";
-        txt = "killed: " + h.verdict;
       }
       return "<tr><td class='mono'>" + esc(h.tree) + "</td><td>" + job(h) +
         "</td><td class='" + cls + "'>" + esc(txt) + "</td><td class='mono'>" +
@@ -2620,11 +2832,134 @@ class Server(ThreadingHTTPServer):
 
     allow_reuse_address = False
     daemon_threads = True
+    # Deep enough to hold everybody who asks during a handover, which is every
+    # queued client at once: their long polls are all answered in the same
+    # instant and all come straight back. Fixed when the socket first listens,
+    # and that socket is then passed from daemon to daemon.
+    request_queue_size = 128
+
+    def __init__(self, address, handler, inherited=None):
+        # Connections accepted and not yet finished with, which is what a
+        # handover waits on. Counted at the accept and not in the handler: a
+        # request taken in the last moment before the daemon stopped listening
+        # has not reached its handler yet, and one in a hundred did exactly
+        # that and was answered by a queue that had already gone.
+        self.in_hand = 0
+        self.in_hand_changed = threading.Condition()
+        ThreadingHTTPServer.__init__(self, address, handler,
+                                     bind_and_activate=inherited is None)
+        if inherited is not None:
+            # Already bound and listening: it is the last daemon's.
+            self.socket.close()
+            self.socket = inherited
+            self.server_address = inherited.getsockname()
+            self.server_name, self.server_port = address
 
     def server_bind(self):
         if IS_WINDOWS:
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         ThreadingHTTPServer.server_bind(self)
+
+    def process_request(self, request, client_address):
+        with self.in_hand_changed:
+            self.in_hand += 1
+        try:
+            ThreadingHTTPServer.process_request(self, request, client_address)
+        except Exception:
+            self.let_go()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            ThreadingHTTPServer.process_request_thread(self, request, client_address)
+        finally:
+            self.let_go()
+
+    def let_go(self):
+        with self.in_hand_changed:
+            self.in_hand -= 1
+            self.in_hand_changed.notify_all()
+
+    def wait_in_hand(self, count, deadline):
+        """Wait for all but `count` accepted connections to be finished with.
+        Only means anything once serve_forever has stopped."""
+        with self.in_hand_changed:
+            while self.in_hand > count:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.in_hand_changed.wait(left)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Handover
+# ---------------------------------------------------------------------------
+#
+# `start --restart` used to stop the daemon and start another. Running jobs
+# came through that -- a lease is re-adopted from state.json -- but the queue
+# did not: every ticket was forgotten, and each client found out on its next
+# poll and asked again. And for the second or two with nothing on the port, a
+# run that asked started a daemon of its own from whatever copy of this file
+# it could find, or ran unqueued; a release was lost. With a dozen agents
+# relying on the queue, changing this file meant picking a moment.
+#
+# Now the new daemon is started first and takes over from the old one:
+#
+#   new  POST /handover {pid}             on a connection it then keeps open
+#   old  stops accepting, lets what it has in hand finish, long polls included
+#   old  replies with its whole state and its listening socket, duplicated
+#        into the new process (WSADuplicateSocket, which is socket.share)
+#   new  builds its queue from that, says K
+#   old  says D and exits; new starts accepting
+#
+# The port is never closed, so nothing is refused: a client that connects in
+# the middle waits in the socket's backlog and is answered by the new daemon.
+# Tickets keep their ids, so the poll that was answered "still queued" by the
+# old daemon is asked again of the new one and means the same thing. No
+# process the queue started is touched at any point.
+#
+# If any step fails the old daemon carries on, and says so in daemon.log.
+
+def can_hand_over():
+    return IS_WINDOWS and hasattr(socket.socket, "share")
+
+
+def take_over(port):
+    """The new daemon's half, up to holding everything: (connection, the
+    listening socket, the state). Raises if the old daemon will not."""
+    conn = socket.create_connection(("127.0.0.1", port),
+                                    timeout=HANDOVER_DRAIN_SECONDS + 15)
+    try:
+        payload = json.dumps({"pid": os.getpid()}).encode("utf-8")
+        conn.sendall(("POST /handover HTTP/1.0\r\nHost: 127.0.0.1:%d\r\n"
+                      "Content-Type: application/json\r\nContent-Length: %d\r\n\r\n"
+                      % (port, len(payload))).encode("ascii") + payload)
+        resp = http.client.HTTPResponse(conn)
+        resp.begin()
+        raw = resp.read()
+        if resp.status != 200:
+            raise RuntimeError("the running daemon answered %d %s"
+                               % (resp.status, raw[:200]))
+        body = json.loads(raw.decode("utf-8"))
+        listener = socket.fromshare(base64.b64decode(body["socket"]))
+        return conn, listener, body["state"]
+    except Exception:
+        conn.close()
+        raise
+
+
+def confirm_take_over(conn):
+    """Tell the old daemon to go, and hear that it has. False means it is
+    still serving and this process must not."""
+    try:
+        conn.settimeout(HANDOVER_CONFIRM_SECONDS)
+        conn.sendall(b"K")
+        return conn.recv(1) == b"D"
+    except Exception:
+        return False
+    finally:
+        conn.close()
 
 
 def origin_path():
@@ -2737,19 +3072,33 @@ def cmd_serve(args):
 
     port = port_from_env(args.port)
     server = None
-    try:
-        server = Server(("127.0.0.1", port), Handler)
-    except OSError:
-        # Somebody else got there first. That IS the leader election; there is
-        # nothing to clean up and nothing to complain about.
-        sys.stderr.write("testq: port %d already held -- another daemon is live\n" % port)
-        return 0
-
-    os.makedirs(runtime_dir(), exist_ok=True)
-    moved = import_legacy_history()
-    if moved:
-        sys.stderr.write("imported %d row(s) from the old JSONL history\n" % moved)
-    queue = Queue()
+    if args.takeover:
+        try:
+            conn, listener, inherited = take_over(port)
+            queue = Queue(inherited=inherited)
+            server = Server(("127.0.0.1", port), Handler, inherited=listener)
+        except Exception as exc:
+            sys.stderr.write("testq: could not take over on port %d: %r\n" % (port, exc))
+            return 1
+        if not confirm_take_over(conn):
+            sys.stderr.write("testq: the old daemon did not let go -- leaving it be\n")
+            return 1
+        sys.stderr.write("took over: %d running, %d queued\n"
+                         % (len(queue.leases), len(queue.queue)))
+        queue.save_state()
+    else:
+        try:
+            server = Server(("127.0.0.1", port), Handler)
+        except OSError:
+            # Somebody else got there first. That IS the leader election; there
+            # is nothing to clean up and nothing to complain about.
+            sys.stderr.write("testq: port %d already held -- another daemon is live\n" % port)
+            return 0
+        os.makedirs(runtime_dir(), exist_ok=True)
+        moved = import_legacy_history()
+        if moved:
+            sys.stderr.write("imported %d row(s) from the old JSONL history\n" % moved)
+        queue = Queue()
     queue.sha = source_sha()
     queue.port = port
     stopping = threading.Event()
@@ -2813,25 +3162,35 @@ def daemon_up(port):
 
 def cmd_start(args):
     port = port_from_env(args.port)
+    old = None
     if daemon_up(port):
+        code, ver = http_json(port, "/version")
+        ver = ver if isinstance(ver, dict) else {}
         if not args.restart:
-            code, ver = http_json(port, "/version")
-            sha = ver.get("sha") if isinstance(ver, dict) else "?"
-            print("testq already running on %d (sha %s)" % (port, sha))
+            print("testq already running on %d (sha %s)" % (port, ver.get("sha", "?")))
             return 0
-        http_json(port, "/quit", {"force": bool(args.force)})
-        for _ in range(40):
-            if not daemon_up(port):
-                break
-            time.sleep(0.25)
+        if ver.get("handover") and can_hand_over():
+            # Not stopped: the new daemon is started beside it and takes the
+            # queue and the port off it. See Handover, below.
+            old = ver
         else:
-            print("the running daemon would not stop; it still has live jobs "
-                  "(add --force to take the box out from under them)")
-            return 1
+            http_json(port, "/quit", {"force": bool(args.force)})
+            for _ in range(40):
+                if not daemon_up(port):
+                    break
+                time.sleep(0.25)
+            else:
+                print("the running daemon is from before a restart could hand the "
+                      "queue over, and it has live jobs. Add --force for this one "
+                      "restart: running jobs carry on, queued ones ask again and "
+                      "keep their places.")
+                return 1
 
-    moved = migrate_runtime_dir()
-    if moved:
-        print("moved the runtime directory to %s" % moved)
+    if old is None:
+        # Only with no daemon running: nothing then has the database open.
+        moved = migrate_runtime_dir()
+        if moved:
+            print("moved the runtime directory to %s" % moved)
     os.makedirs(runtime_dir(), exist_ok=True)
     sha = source_sha()
     snapshot = os.path.join(runtime_dir(), "testq-%s.py" % sha)
@@ -2864,18 +3223,44 @@ def cmd_start(args):
     logfh.flush()
     env = dict(os.environ)
     env["TESTQ_PORT"] = str(port)
-    subprocess.Popen(
-        [sys.executable, snapshot, "serve", "--port", str(port)],
+    child = subprocess.Popen(
+        [sys.executable, snapshot, "serve", "--port", str(port)]
+        + (["--takeover"] if old else []),
         stdout=logfh, stderr=logfh, stdin=subprocess.DEVNULL,
         creationflags=flags, close_fds=True, env=env,
         cwd=runtime_dir(),
     )
+    if old:
+        return await_handover(port, old, child, sha)
     for _ in range(40):
         if daemon_up(port):
             print("testq %s listening on http://localhost:%d/" % (sha, port))
             return 0
         time.sleep(0.25)
     print("testq did not come up within 10s -- see %s" % log_path())
+    return 1
+
+
+def await_handover(port, old, child, sha):
+    """Watch a handover from the outside: it is done when the port answers
+    from another process, and it has failed when the new daemon has exited."""
+    deadline = time.monotonic() + HANDOVER_DRAIN_SECONDS + HANDOVER_CONFIRM_SECONDS + 15
+    while time.monotonic() < deadline:
+        # Slow to answer while the two change over, never refused.
+        code, ver = http_json(port, "/version", timeout=2.0)
+        if isinstance(ver, dict) and ver.get("pid") not in (None, old.get("pid")):
+            code, state = http_json(port, "/state")
+            state = state if isinstance(state, dict) else {}
+            print("testq %s took over from %s on http://localhost:%d/ -- "
+                  "%d running and %d queued carried across"
+                  % (sha, old.get("sha", "?"), port,
+                     len(state.get("running", [])), len(state.get("queued", []))))
+            return 0
+        if child.poll() is not None:
+            break
+        time.sleep(0.25)
+    print("the handover did not happen; testq %s is still serving and nothing "
+          "was interrupted -- see %s" % (old.get("sha", "?"), log_path()))
     return 1
 
 
@@ -3234,12 +3619,16 @@ def main(argv):
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--allow-worktree", action="store_true",
                    help="permit serving from a worktree path (debugging only)")
+    p.add_argument("--takeover", action="store_true",
+                   help="take the queue and the port off the running daemon")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("start", help="snapshot and launch the daemon")
     p.add_argument("--port", type=int, default=None)
-    p.add_argument("--restart", action="store_true", help="replace a running daemon")
-    p.add_argument("--force", action="store_true", help="restart even with live jobs")
+    p.add_argument("--restart", action="store_true",
+                   help="replace a running daemon; its queue and jobs carry across")
+    p.add_argument("--force", action="store_true",
+                   help="restart a daemon too old to hand over, even with live jobs")
     p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("status", help="what the box is doing")
