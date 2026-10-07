@@ -131,6 +131,25 @@ EXCLUSIVE_STRAY_PATIENCE = 300.0
 IDLE_STRAY_SECONDS = 120.0
 IDLE_STRAY_CORES = 0.1
 
+# A working one used to dock a slot each, off the eight, and that was the
+# queue's biggest cost by a distance: in a day and a half, three fifths of all
+# queueing was jobs waiting with slots free on paper, and twice the box sat
+# empty for most of an hour granting nothing because eight engines somebody
+# had started by hand were on it. Jobs that time out in the queue get run
+# outside it, which is more of the same.
+#
+# The eight is an admission policy on a box with sixteen cores, so the first
+# few outside engines are paid for out of the cores the policy leaves over,
+# and only the ones past that come off the slots. Not all eight of the spare
+# cores: the agents, the recorders and the desktop live there too. And however
+# many there are, the queue keeps a floor it can always grant -- a slow queue
+# is a nuisance, a stopped one sends its jobs round the outside.
+#
+# This is about throughput, not about what a run may assert. box_engines
+# still counts every outside engine, and an exclusive job still wants none.
+STRAY_FREE = 4
+STRAY_FLOOR = 2
+
 # A run whose engine finished its work and then never exited keeps its lease
 # for as long as its shell lives, and reap() only ever looks at the shell. A
 # 48-second capture held the GPU for two hours that way, with three jobs
@@ -1487,7 +1506,7 @@ class Queue(object):
         used_gpu = sum(self.need_of(l)[1] for l in self.leases.values())
         # Capacity we cannot use because somebody outside the queue is using
         # it. Never let this drive availability negative.
-        penalty = min(self.stray, self.capacity["cpu"])
+        penalty = self.stray_penalty()
         free_cpu = max(0, self.capacity["cpu"] - used_cpu - penalty)
         free_gpu = max(0, self.capacity["gpu"] - used_gpu)
         # What is free before the penalty and before anything is held back
@@ -1582,6 +1601,15 @@ class Queue(object):
                 free_gpu = max(0, free_gpu - need_gpu)
                 reserved_mutexes.update(mutexes)
         return granted
+
+    def stray_penalty(self):
+        """Slots the engines outside the queue cost it. Holds the lock.
+
+        See STRAY_FREE. Never the whole box: with STRAY_FLOOR slots always
+        left, a crowd of outside engines slows the queue and cannot stop it.
+        """
+        docked = max(0, self.stray - STRAY_FREE)
+        return min(docked, max(0, self.capacity["cpu"] - STRAY_FLOOR))
 
     def waiting_on(self, ticket, blocked_mutex, raw_cpu, raw_gpu, penalty):
         """One word for what is keeping this ticket in the queue. Holds the
@@ -2099,7 +2127,8 @@ class Queue(object):
                     "pid": os.getpid(),
                 },
                 "capacity": dict(self.capacity),
-                "used": {"cpu": used_cpu, "gpu": used_gpu, "stray_penalty": self.stray},
+                "used": {"cpu": used_cpu, "gpu": used_gpu,
+                         "stray_penalty": self.stray_penalty()},
                 "godot": {
                     "observed": self.observed,
                     "expected": sum(int(l.get("engines", 0)) for l in self.leases.values()),
@@ -2406,7 +2435,8 @@ function render(s) {
   const idle = s.godot.idle || 0;
   $("banner").innerHTML = s.godot.unmanaged > 0
     ? '<div class="banner">' + s.godot.unmanaged + ' Godot engine(s) running outside the queue' +
-      ' &mdash; capacity reduced to match. A worktree without the queue shim, or the editor.' +
+      ' &mdash; ' + (used.stray_penalty ? used.stray_penalty + ' slot(s) docked for them.'
+        : 'no slots docked yet.') + ' A worktree without the queue shim, or the editor.' +
       (idle ? ' ' + idle + ' more sitting idle, not counted.' : '') +
       outside(s) + '</div>'
     : idle > 0

@@ -458,7 +458,8 @@ class Observed(Box):
             self.engine(pid, 997, WT_B)                    # finished, never exited
         self.engine(60, 996, WT_A)                         # working
         self.run_for(20, rates={60: 1.0})
-        suite = self.job(script="run_test.sh", tree=SNAP, winpid=100, gpu=0, slots=1)
+        suite = self.job(script="run_test_par.sh", tree=SNAP, winpid=100, gpu=0,
+                         slots=testq.CAPACITY["cpu"], engines=1)
         self.assertFalse(self.running(suite))
         self.run_for(testq.IDLE_STRAY_SECONDS, rates={60: 1.0})
         self.assertTrue(self.running(suite))
@@ -645,6 +646,48 @@ class Parked(Box):
         self.assertNotIn("resumed_s", again)
 
 
+class Docked(Box):
+    """What the engines outside the queue cost it in slots."""
+
+    def outside(self, count):
+        self.rates = dict((pid, 1.0) for pid in range(900, 900 + count))
+        for pid in self.rates:
+            self.engine(pid, 997, WT_B)
+        self.run_for(20, rates=self.rates)
+
+    def wide(self, slots, winpid):
+        return self.job(script="run_test_par.sh", arg=str(slots), tree=SNAP,
+                        winpid=winpid, gpu=0, slots=slots)
+
+    def too_wide(self, slots):
+        """A job this wide waits. It is taken out again so that it is not
+        at the head, holding slots back from the next one asked about."""
+        ticket = self.wide(slots, 100)
+        self.assertFalse(self.running(ticket))
+        self.assertEqual(ticket["waiting_on"], "outside")
+        self.q.cancel(ticket["id"])
+
+    def test_the_first_few_cost_nothing(self):
+        self.outside(testq.STRAY_FREE)
+        self.assertTrue(self.running(self.wide(testq.CAPACITY["cpu"], 100)))
+
+    def test_the_next_one_costs_a_slot(self):
+        self.outside(testq.STRAY_FREE + 1)
+        self.too_wide(testq.CAPACITY["cpu"])
+        self.assertTrue(self.running(self.wide(testq.CAPACITY["cpu"] - 1, 200)))
+        self.assertEqual(self.q.snapshot()["used"]["stray_penalty"], 1)
+
+    def test_a_crowd_of_them_cannot_stop_the_queue(self):
+        self.outside(3 * testq.CAPACITY["cpu"])
+        self.too_wide(testq.STRAY_FLOOR + 1)
+        self.assertTrue(self.running(self.wide(testq.STRAY_FLOOR, 200)))
+
+    def test_the_run_is_still_told_about_every_one(self):
+        self.outside(testq.STRAY_FREE)
+        suite = self.job(script="run_test.sh", tree=SNAP, winpid=100, gpu=0)
+        self.assertEqual(suite["box_engines"], testq.STRAY_FREE + 1)
+
+
 class Exclusive(Box):
     """run_mp wants the box to itself, and there is nearly always an engine
     on it that the queue did not start."""
@@ -720,7 +763,8 @@ class WaitedOn(Box):
             self.engine(pid, 997, WT_B)
             rates[pid] = 1.0
         self.run_for(20, rates=rates)
-        suite = self.job(script="run_test.sh", tree=SNAP, winpid=100, gpu=0)
+        suite = self.job(script="run_test_par.sh", tree=SNAP, winpid=100, gpu=0,
+                         slots=testq.CAPACITY["cpu"])
         self.assertFalse(self.running(suite))
         self.assertEqual(suite["blocked_on"],
                          "waiting for slots -- 8 unmanaged engine(s) on the box")

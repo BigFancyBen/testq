@@ -447,7 +447,16 @@ cannot put a stranger under a job's shell.
 **Engines it did not grant still count.** Worktrees without the client, and the
 editor, are real load. The daemon counts what is actually on the box, subtracts
 what it granted, and docks capacity by the difference (debounced over two
-samples). That one rule also stops a restarted daemon from overgranting on top
+samples) — past the first four, and never below two slots. The eight slots
+are a policy on a sixteen-core box, so the first few outside engines are paid
+for out of the cores the policy leaves spare; docking one for one was the
+queue's largest cost, three fifths of all queueing being jobs that waited with
+slots free on paper, and twice it left the box empty for most of an hour
+granting nothing. The floor is so that a crowd of them slows the queue and
+cannot stop it, since a job that times out in a stopped queue gets run outside
+it. `STRAY_FREE` and `STRAY_FLOOR`, beside `CAPACITY`. A run is still told
+about every one of them in `boxEngines`, and an exclusive job still wants
+none. That one rule also stops a restarted daemon from overgranting on top
 of the previous one's orphans, and it is why the page can show "2 unmanaged
 engines".
 
@@ -577,7 +586,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-Ninety-two tests, standard library only, a couple of seconds. They start no
+Ninety-six tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
