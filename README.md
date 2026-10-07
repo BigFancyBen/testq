@@ -118,9 +118,9 @@ with `TESTQ_PY` set.
     python -m unittest discover tests # the queue's own tests; starts nothing
 
 State, the history database and the daemon's own snapshot live in
-`%LOCALAPPDATA%\testq\`. `TESTQ_HOME` overrides. (An older
-`%LOCALAPPDATA%\mfrs-testq\` is used instead when it exists, so a machine that
-ran the tool under its first name keeps its history; see "History" at the end.)
+`%LOCALAPPDATA%\testq\`. `TESTQ_HOME` overrides. (A machine that ran the tool
+under its first name has them in `%LOCALAPPDATA%\mfrs-testq\`; the next `start`
+moves that directory across, history and all. See "History" at the end.)
 
 The daemon listens on 127.0.0.1 only, and refuses any request that does not
 come from this machine's own clients or its own page: a `Host` that is not
@@ -664,7 +664,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-Ninety-nine tests, standard library only, a couple of seconds. They start no
+A hundred and five tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
@@ -680,10 +680,14 @@ through.
 
 testq started as `tools/testq/` inside mfrs and was lifted out when a second
 project turned out to be half the load. That is where the remaining traces of
-the old name come from, and they are deliberate: the legacy runtime directory
-`%LOCALAPPDATA%\mfrs-testq` is still honoured so accumulated run history is
-not thrown away, and `tray.ps1` keeps `mfrs-testq-tray-<port>` as its mutex so
-an old vendored tray and this one still exclude each other. What changed on
+the old name come from. The runtime directory was `%LOCALAPPDATA%\mfrs-testq`
+for as long as a project might still carry its own copy of the daemon, since
+either copy could win the port and they had to agree on where the history
+was; none does now, so `start` moves it to `%LOCALAPPDATA%\testq` the first
+time it runs with no daemon up — renamed if the directory will let go, copied
+if something is sitting in it, in which case the old one is left behind with
+a `MOVED.txt` and never read again. `tray.ps1` keeps `mfrs-testq-tray-<port>`
+as its mutex so an old tray and this one still exclude each other. What changed on
 the way out — `projects.json`, the `project` field, the Node client, the tray
 raised by the daemon, self-rescue of hung runs, reading the process table
 without WMI, the tests — is in the commit log. None of it changed the wire

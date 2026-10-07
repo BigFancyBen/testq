@@ -195,7 +195,12 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 IS_WINDOWS = os.name == "nt"
 
 
+RUNTIME_NAME = "testq"
 LEGACY_RUNTIME_NAME = "mfrs-testq"
+
+
+def runtime_base():
+    return os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share")
 
 
 def runtime_dir():
@@ -206,20 +211,67 @@ def runtime_dir():
     daemon executing from that path, so `start` copies the file out and the
     server refuses to run from anywhere else.
 
-    The legacy name is honoured when it is already there, and this matters more
-    than tidiness: while a project still carries its own vendored copy of this
-    file, either copy may win the port bind, and they have to agree on where the
-    state and the history database live or the queue's memory depends on which
-    one started first.
+    The directory was `mfrs-testq` while this lived in one project, and
+    stayed that for as long as a project might still carry its own copy of
+    this file: either copy could win the port bind, and they had to agree on
+    where the history was. None does now, so `start` moves it (see
+    migrate_runtime_dir). The old name is still read when it is all there
+    is -- a move that could not be made yet -- and once the new one exists
+    it wins, so that nothing recreating the old directory can split the
+    queue's memory in two.
     """
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/.local/share")
     override = os.environ.get("TESTQ_HOME")
     if override:
         return override
-    legacy = os.path.join(base, LEGACY_RUNTIME_NAME)
-    if os.path.isdir(legacy):
+    home = os.path.join(runtime_base(), RUNTIME_NAME)
+    legacy = os.path.join(runtime_base(), LEGACY_RUNTIME_NAME)
+    if not os.path.isdir(home) and os.path.isdir(legacy):
         return legacy
-    return os.path.join(base, "testq")
+    return home
+
+
+def migrate_runtime_dir():
+    """Move the runtime directory from its first name to its own, once. The
+    new path if it moved, "" if there was nothing to do or it could not.
+
+    Only ever called by `start` with no daemon running, which is the one
+    moment nothing has the database open.
+
+    A rename when the directory will let go, and it often will not: the tray
+    icon is a PowerShell that was started in there and holds it for as long
+    as the icon is up. So failing that it is copied -- to one side first and
+    renamed into place, so that a copy interrupted half way is never taken
+    for the directory -- and the old one is left behind with a note in it.
+    Nothing reads it again once the new one exists.
+    """
+    if os.environ.get("TESTQ_HOME"):
+        return ""
+    home = os.path.join(runtime_base(), RUNTIME_NAME)
+    legacy = os.path.join(runtime_base(), LEGACY_RUNTIME_NAME)
+    if os.path.exists(home) or not os.path.isdir(legacy):
+        return ""
+    try:
+        os.rename(legacy, home)
+        return home
+    except OSError:
+        pass
+    moving = home + ".moving"
+    try:
+        shutil.rmtree(moving, ignore_errors=True)
+        shutil.copytree(legacy, moving)
+        os.rename(moving, home)
+    except (OSError, shutil.Error) as exc:
+        sys.stderr.write("could not move %s to %s: %r\n" % (legacy, home, exc))
+        shutil.rmtree(moving, ignore_errors=True)
+        return ""
+    try:
+        with open(os.path.join(legacy, "MOVED.txt"), "w", encoding="utf-8") as fh:
+            fh.write("testq's runtime directory moved to %s on %s.\n"
+                     "This copy is no longer read and can be deleted.\n"
+                     % (home, time.strftime("%Y-%m-%d")))
+    except OSError:
+        pass
+    return home
 
 
 def state_path():
@@ -2655,6 +2707,9 @@ def spawn_tray(port, auto=True):
             # from here. CREATE_NO_WINDOW gives it a console nobody can see,
             # which is what was wanted, and the child outlives us either way.
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            # Not the daemon's own directory, which it would otherwise
+            # inherit and hold open for as long as the icon is up.
+            cwd=os.path.expanduser("~"),
             close_fds=True)
     except Exception:
         return False
@@ -2774,6 +2829,9 @@ def cmd_start(args):
                   "(add --force to take the box out from under them)")
             return 1
 
+    moved = migrate_runtime_dir()
+    if moved:
+        print("moved the runtime directory to %s" % moved)
     os.makedirs(runtime_dir(), exist_ok=True)
     sha = source_sha()
     snapshot = os.path.join(runtime_dir(), "testq-%s.py" % sha)

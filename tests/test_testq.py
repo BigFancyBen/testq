@@ -934,6 +934,78 @@ class Estimates(Box):
 # ---------------------------------------------------------------------------
 
 @unittest.skipUnless(os.name == "nt", "reads Windows process memory")
+class RuntimeDir(unittest.TestCase):
+    """The directory had one project's name on it, and moves once."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(prefix="testq-base-")
+        self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
+        env = dict(os.environ, LOCALAPPDATA=self.base)
+        env.pop("TESTQ_HOME", None)
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(sys, "stderr", io.StringIO())
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.legacy = os.path.join(self.base, testq.LEGACY_RUNTIME_NAME)
+        self.home = os.path.join(self.base, testq.RUNTIME_NAME)
+
+    def old_install(self):
+        os.makedirs(self.legacy)
+        with open(os.path.join(self.legacy, "testq.db"), "w") as fh:
+            fh.write("a week of runs")
+
+    def history(self):
+        with open(os.path.join(testq.runtime_dir(), "testq.db")) as fh:
+            return fh.read()
+
+    def test_a_new_machine_gets_the_new_name(self):
+        self.assertEqual(testq.runtime_dir(), self.home)
+        self.assertEqual(testq.migrate_runtime_dir(), "")
+
+    def test_the_old_one_is_read_until_it_is_moved(self):
+        self.old_install()
+        self.assertEqual(testq.runtime_dir(), self.legacy)
+
+    def test_it_moves_with_everything_in_it(self):
+        self.old_install()
+        self.assertEqual(testq.migrate_runtime_dir(), self.home)
+        self.assertFalse(os.path.exists(self.legacy))
+        self.assertEqual(testq.runtime_dir(), self.home)
+        self.assertEqual(self.history(), "a week of runs")
+
+    def test_a_directory_that_will_not_let_go_is_copied(self):
+        self.old_install()
+        rename = os.rename
+
+        def held(src, dst):
+            if src == self.legacy:
+                raise PermissionError("the tray icon is sitting in it")
+            return rename(src, dst)
+
+        with mock.patch.object(os, "rename", held):
+            self.assertEqual(testq.migrate_runtime_dir(), self.home)
+        self.assertEqual(testq.runtime_dir(), self.home)
+        self.assertEqual(self.history(), "a week of runs")
+        self.assertTrue(os.path.exists(os.path.join(self.legacy, "MOVED.txt")))
+        self.assertFalse(os.path.exists(self.home + ".moving"))
+
+    def test_once_moved_the_old_name_is_never_read_again(self):
+        self.old_install()
+        testq.migrate_runtime_dir()
+        os.makedirs(self.legacy)                           # something put it back
+        self.assertEqual(testq.runtime_dir(), self.home)
+        self.assertEqual(testq.migrate_runtime_dir(), "")
+
+    def test_a_home_somebody_chose_is_left_alone(self):
+        self.old_install()
+        with mock.patch.dict(os.environ, {"TESTQ_HOME": self.base}):
+            self.assertEqual(testq.runtime_dir(), self.base)
+            self.assertEqual(testq.migrate_runtime_dir(), "")
+        self.assertTrue(os.path.isdir(self.legacy))
+
+
 class RequestAllowed(unittest.TestCase):
     """Who may talk to the daemon: its clients and its own page, not a
     website that happens to be open in the browser on the same machine."""
