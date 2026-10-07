@@ -1,0 +1,3 @@
+# Bash will not source a file with carriage returns in it, and a client that
+# cannot be sourced is every run on the box going unqueued.
+*.sh text eol=lf
