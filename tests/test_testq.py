@@ -809,6 +809,37 @@ class Cancel(Box):
         self.assertEqual(self.verdict(first), "cancelled")
 
 
+class OldBashClients(Box):
+    """The vendored bash clients take any reply with "granted" and then
+    "true" in it for a grant. See not_granted_flag."""
+
+    def looks_granted(self, reply):
+        text = json.dumps(reply)
+        return '"granted"' in text and "true" in text.split('"granted"', 1)[1]
+
+    def test_a_queued_reply_never_says_true(self):
+        self.job(winpid=100)                               # no estimate: a floor
+        second = self.job(script="b.mjs", winpid=200)
+        self.assertEqual(self.q.start_in(second, self.q.order()), (None, True))
+        with mock.patch.object(testq, "WAIT_POLL_SECONDS", 0.0):
+            reply = self.q.poll(second["id"])
+        self.assertFalse(reply["granted"])
+        self.assertEqual(reply["start_in_floor"], 1)
+        self.assertFalse(self.looks_granted(reply))
+
+    def test_nor_does_the_answer_to_the_acquire(self):
+        self.job(winpid=100)
+        second = self.job(script="b.mjs", winpid=200, exclusive=True, idle_ok=True)
+        reply = testq.acquire_reply(self.q, second)
+        self.assertFalse(reply["granted"])
+        self.assertFalse(self.looks_granted(reply))
+
+    def test_a_grant_still_does(self):
+        first = self.job(winpid=100)
+        self.assertTrue(self.looks_granted(testq.acquire_reply(self.q, first)))
+        self.assertTrue(self.looks_granted(self.q.poll(first["id"])))
+
+
 class StartIn(Box):
     def test_the_gpu_line_adds_up(self):
         self.job(winpid=100, eta_s=100)

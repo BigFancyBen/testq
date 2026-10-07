@@ -170,10 +170,32 @@ Four optional fields say things only the job knows:
 | `idleOk` / `idle_ok` | A window that is meant to sit there. It will not be taken for a hang; `maxSeconds` still applies. |
 | `slotsMin` / `slots_min` | The narrowest a job can run on, for one whose engine count follows the width it is granted. See "Flexible width". |
 
-**Bash** — there is no bash client in this repository yet. The one in use is
-mfrs's `run_lib.sh`, whose `testq_acquire` / `testq_release` speak the same
-protocol over `curl`; `clients/testq.mjs` is the reference for what to send
-(`POST /acquire`, long-poll `POST /wait`, `POST /release`, all JSON).
+**Bash** — vendor `clients/testq.sh` the same way and source it:
+
+```bash
+. "$(dirname "${BASH_SOURCE[0]}")/testq.sh"
+trap 'testq_release $?' EXIT
+testq_acquire --arg "$WHICH" --cpu 1 --engines 1      # --gpu 1 if it opens a window
+timeout 1500 "$GODOT" --headless --path "$PROJ" -- --test="$WHICH"
+```
+
+The flags are the same fields (`--cpu`, `--min-cpu`, `--gpu`, `--engines`,
+`--exclusive`, `--mutex`, `--size`, `--max`, `--idle-ok`, `--project`); the
+file's header lists them. The grant comes back in `$TESTQ_SLOTS` and
+`$TESTQ_BOX_ENGINES`. Put the `timeout` round each engine and never round the
+script, so that time spent queued is charged to nothing.
+
+Anything else speaks the protocol directly: `POST /acquire`, long-poll
+`POST /wait`, `POST /release`, all JSON, and the two clients are the reference
+for what to send. Read the reply's `granted` **field**. A client that looks
+for the word `true` anywhere after the word `granted` — which is what the
+first bash client did, in thirty checkouts — takes a queued reply for a grant
+the day that reply grows a second yes-or-no, and runs on top of whatever it
+was queued behind. It did, three hundred times a day, and those runs were
+most of the "engines outside the queue" the daemon was docking slots for. So
+the daemon now keeps `true` out of every reply that is not a grant (its
+yes-or-no fields are `1` and `0` there), and there is a test that holds it to
+that.
 
 The one rule in either language: acquire BEFORE any engine starts, including an
 import pass, and give the slot back when the last engine exits. A run that has
@@ -233,6 +255,62 @@ A slot that is never released is not leaked. The daemon tracks each client by
 so a script killed outright — or one whose failure path calls `exit` — costs the
 queue nothing. Release explicitly anyway when you can: it is immediate, and it
 records the exit code.
+
+## Adding a project
+
+The queue only knows about the engines that ask it. One harness that launches
+Godot without asking is load every other project's tests are measured against
+and cannot see, so the whole of the integration is making sure nothing does:
+
+1. **Vendor a client** — `clients/testq.mjs` or `clients/testq.sh` — into the
+   project. Copy it; do not import it across an absolute path.
+2. **Every script that starts an engine acquires first**, before an import
+   pass too, and releases when its last engine exits. One invocation is one
+   job, however many engines it runs: say how many in `engines`.
+3. **Book what it uses.** One slot a headless engine. `gpu: 1` if it opens a
+   window. `exclusive` only for a measurement between live processes. A
+   mutex for anything two runs must not do at once — a fixed port, a shared
+   output directory.
+4. **Give it a deadline**: `maxSeconds` in Node, a `timeout` round each engine
+   in bash.
+5. **No bare engine commands in the docs.** If a README or a tool's header
+   says `godot --headless --script …`, that is what gets pasted, and it runs
+   outside the queue for as long as it likes. Give one-off runs a wrapper that
+   acquires, and document the wrapper.
+6. **Do not teach `TESTQ=off`.** It is for debugging the queue itself. A
+   headless suite does not need it to "stay off the GPU queue": a job that
+   books no `gpu` is never in the GPU line.
+7. Optionally register the project in `projects.json` (below), for estimates
+   on a new worktree's first run and for `reap`.
+
+Check it with `python testq.py status` while the project's suite runs: the job
+should be a `RUN` line, and there should be no `OUT` line for its worktree.
+`OUT` is an engine the queue did not start, by worktree — which is the list of
+what is still to be brought in.
+
+### What to tell the agents
+
+Most runs on this box are started by an agent reading the project's
+`CLAUDE.md`, so that file is where the rules have to be. Something like:
+
+```markdown
+## Running Godot
+
+Every engine run on this machine goes through testq (`../_tools/testq`, page
+at http://localhost:43117/). The run scripts ask it for a slot themselves.
+
+- Start engines only through the project's run scripts. Never launch `godot`
+  directly and never set `TESTQ=off`: an engine outside the queue slows every
+  other worktree's tests and makes their timing failures look real.
+- A run may print `[testq] queued at position N … starts in ~12m`. That is
+  normal. Nothing has launched yet; do not cancel it and try another way.
+- If the wait is longer than your command's timeout, run it in the
+  background. A job killed while queued keeps its place for 15 minutes if the
+  same command is run again.
+- Do not kill Godot by image name (`taskkill /IM`). Other worktrees' runs are
+  the same image.
+- `python ../_tools/testq/testq.py status` shows what is running and queued.
+```
 
 ## The page
 
@@ -586,7 +664,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-Ninety-six tests, standard library only, a couple of seconds. They start no
+Ninety-nine tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over

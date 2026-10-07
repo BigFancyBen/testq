@@ -2036,7 +2036,7 @@ class Queue(object):
                         "granted": False,
                         "position": position,
                         "start_in_s": start_in,
-                        "start_in_floor": floor,
+                        "start_in_floor": not_granted_flag(floor),
                         "waiting_s": round(now() - ticket["enqueued_at"], 1),
                         "blocked_on": ticket.get("blocked_on", ""),
                         "ahead": [self.brief(t) for t in order[:position - 1][:4]],
@@ -2149,6 +2149,28 @@ class Queue(object):
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 
+def not_granted_flag(value):
+    """A yes or no for a reply that says a ticket is still queued, as 1 or 0
+    and never as JSON's `true`.
+
+    The bash clients read these replies without a JSON parser, and the test
+    every vendored copy of them shipped with for "was I granted" is the word
+    "granted" followed anywhere by the word "true". The day `start_in_floor`
+    was added to the queued reply, a ticket queued behind anything with no
+    estimate -- or behind a mutex, or behind engines outside the queue, which
+    is always a floor -- read as granted. The run started at once, outside
+    the queue, on top of whatever it had been queued behind; its ticket was
+    never polled again and went into the history as abandoned a minute
+    later, three hundred times a day. Those runs were most of the "engines
+    outside the queue" this daemon then docked slots for.
+
+    There are thirty checkouts carrying that client and no way to change
+    them all at once, so the reply is what gives way. Nothing that is not
+    granted may say `true` anywhere in it: test_a_queued_reply_never_says_true.
+    """
+    return 1 if value else 0
+
+
 def request_allowed(host, origin, port):
     """Whether a request came from this machine's own clients or its own page.
 
@@ -2172,6 +2194,49 @@ def request_allowed(host, origin, port):
         return True
     origin = origin.strip().lower()
     return origin in ["http://%s:%d" % (h, port) for h in LOOPBACK_HOSTS]
+
+
+def acquire_reply(queue, ticket):
+    """What /acquire says back about the ticket it just made."""
+    # Say straight away whether this went through. A client that has to
+    # wait can then print one line about it now, instead of staying
+    # silent until its first long poll happens to come back -- which,
+    # if the wait is under 25 s, is never.
+    with queue.lock:
+        granted = ticket["id"] in queue.leases
+        position, blocked = 0, ""
+        start_in, floor = 0, False
+        if not granted:
+            order = queue.order()
+            position = next((i + 1 for i, t in enumerate(order)
+                             if t["id"] == ticket["id"]), 0)
+            blocked = ticket.get("blocked_on", "")
+            start_in, floor = queue.start_in(ticket, order)
+        note = queue.note_for(ticket.get("tree_id", ""))
+    return {
+        "ticket": ticket["id"],
+        "eta_s": ticket.get("eta_s"),
+        "granted": granted,
+        "position": position,
+        "blocked_on": blocked,
+        # Roughly when a queued ticket starts, and whether that is only
+        # a floor because something ahead of it has no estimate.
+        "start_in_s": start_in,
+        "start_in_floor": not_granted_flag(floor),
+        # Set when this ticket picked up the wait of one whose client
+        # died in the queue: how long it has now been waiting in all.
+        "resumed_s": ticket.get("resumed_s", 0),
+        # Something this worktree should be told -- today, only that
+        # its last run was killed here and why.
+        "note": note,
+        # Only meaningful when granted is true; a queued ticket has no
+        # grant to describe yet and the client reads it again off the
+        # /wait response that finally grants it.
+        "box_engines": ticket.get("box_engines", 0),
+        # The width actually granted, which for a flexible job can be
+        # less than it asked (see try_shrink). Same caveat as above.
+        "slots": ticket.get("slots", 0),
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2243,46 +2308,8 @@ class Handler(BaseHTTPRequestHandler):
                     "daemon_proto": PROTO,
                     "hint": origin_hint(),
                 })
-            ticket = self.queue.enqueue(body)
-            # Say straight away whether this went through. A client that has to
-            # wait can then print one line about it now, instead of staying
-            # silent until its first long poll happens to come back -- which,
-            # if the wait is under 25 s, is never.
-            with self.queue.lock:
-                granted = ticket["id"] in self.queue.leases
-                position, blocked = 0, ""
-                start_in, floor = 0, False
-                if not granted:
-                    order = self.queue.order()
-                    position = next((i + 1 for i, t in enumerate(order)
-                                     if t["id"] == ticket["id"]), 0)
-                    blocked = ticket.get("blocked_on", "")
-                    start_in, floor = self.queue.start_in(ticket, order)
-                note = self.queue.note_for(ticket.get("tree_id", ""))
-            return self._send(200, {
-                "ticket": ticket["id"],
-                "eta_s": ticket.get("eta_s"),
-                "granted": granted,
-                "position": position,
-                "blocked_on": blocked,
-                # Roughly when a queued ticket starts, and whether that is only
-                # a floor because something ahead of it has no estimate.
-                "start_in_s": start_in,
-                "start_in_floor": floor,
-                # Set when this ticket picked up the wait of one whose client
-                # died in the queue: how long it has now been waiting in all.
-                "resumed_s": ticket.get("resumed_s", 0),
-                # Something this worktree should be told -- today, only that
-                # its last run was killed here and why.
-                "note": note,
-                # Only meaningful when granted is true; a queued ticket has no
-                # grant to describe yet and the client reads it again off the
-                # /wait response that finally grants it.
-                "box_engines": ticket.get("box_engines", 0),
-                # The width actually granted, which for a flexible job can be
-                # less than it asked (see try_shrink). Same caveat as above.
-                "slots": ticket.get("slots", 0),
-            })
+            return self._send(200, acquire_reply(
+                self.queue, self.queue.enqueue(body)))
         if path == "/wait":
             job_id = str(body.get("ticket", ""))
             return self._send(200, self.queue.poll(job_id))
