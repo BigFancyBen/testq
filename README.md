@@ -33,8 +33,6 @@ never there. testq makes every run take its turn.
   it is waiting for and roughly when it will start.
 - **One stuck job cannot hold everyone up.** A run that has frozen while
   others wait behind it is cleared out, and its owner is told what happened.
-- **Interruptions only when they matter.** You hear about a crash or a hang.
-  You do not hear about every test an agent is in the middle of fixing.
 - **Upgrades that interrupt nobody.** A new version takes over from the old
   one mid-flight. Running jobs carry on and the line keeps its order.
 - **Nothing to set up.** One file, no installation. It starts itself the first
