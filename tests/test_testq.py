@@ -186,6 +186,151 @@ class ArgSize(unittest.TestCase):
         self.assertEqual(testq.arg_size(""), ("", None))
 
 
+class AlertFor(unittest.TestCase):
+    """What the tray interrupts somebody with."""
+
+    def test_a_test_that_failed_is_not_news(self):
+        for code in (0, 1, 2):
+            self.assertEqual(testq.alert_for(code, "released"), "")
+
+    def test_a_run_the_queue_killed_is(self):
+        self.assertEqual(testq.alert_for(None, "stalled"), "killed: stalled")
+        self.assertEqual(testq.alert_for(None, "overran"), "killed: overran")
+
+    def test_an_engine_that_died_is(self):
+        self.assertEqual(testq.alert_for(3221225477, "released"),
+                         "crashed: access violation")
+        self.assertEqual(testq.alert_for(3221226525, "released"),
+                         "crashed: 0xC000041D")
+        self.assertEqual(testq.alert_for(139, "released"), "crashed: SIGSEGV")
+
+    def test_the_same_crash_read_as_a_signed_number(self):
+        self.assertEqual(testq.alert_for(-1073741819, "released"),
+                         "crashed: access violation")
+
+    def test_somebody_stopping_a_run_is_not_a_crash(self):
+        for code in (0xC000013A, 124, 130, 137, 143):
+            self.assertEqual(testq.alert_for(code, "released"), "")
+
+    def test_a_run_that_just_went_away_says_nothing(self):
+        for verdict in ("abandoned", "reclaimed", "cancelled"):
+            self.assertEqual(testq.alert_for(None, verdict), "")
+
+    def test_an_exit_code_that_is_not_a_number(self):
+        for code in (None, "1", True, 1.5):
+            self.assertEqual(testq.alert_for(code, "released"), "")
+
+
+class AlertInState(Box):
+    def test_the_history_the_tray_reads_carries_it(self):
+        crashed = self.job(gpu=0)
+        self.q.release(crashed["id"], 3221225477)
+        failed = self.job(script="t.mjs", winpid=200, gpu=0)
+        self.q.release(failed["id"], 1)
+        rows = self.q.snapshot()["history"]
+        self.assertEqual([(r["exit"], r["alert"]) for r in rows],
+                         [(1, ""), (3221225477, "crashed: access violation")])
+
+
+# ---------------------------------------------------------------------------
+# Handover
+# ---------------------------------------------------------------------------
+
+class Handover(Box):
+    """One daemon's queue, exported and adopted by the next. The sockets are
+    not here: this is what has to be true of the state that crosses."""
+
+    def successor(self):
+        # Through JSON, as it travels.
+        blob = json.loads(json.dumps(self.q.export_state()))
+        return testq.Queue(dict(testq.CAPACITY, gpu=self.GPUS), inherited=blob)
+
+    def test_tickets_cross_under_their_own_ids_and_in_order(self):
+        running = self.job()
+        first = self.job(script="b.mjs", tree=WT_A, winpid=200)
+        self.clock += 30
+        second = self.job(script="c.mjs", tree=WT_B, winpid=300)
+        new = self.successor()
+        self.assertEqual(list(new.leases), [running["id"]])
+        self.assertEqual([t["id"] for t in new.order()], [first["id"], second["id"]])
+        self.assertEqual(new.queue[0]["enqueued_at"], first["enqueued_at"])
+
+    def test_the_next_poll_is_answered_as_the_last_one_was(self):
+        self.job()
+        waiting = self.job(script="b.mjs", tree=WT_A, winpid=200)
+        new = self.successor()
+        def wait(seconds):
+            self.clock += seconds
+
+        with mock.patch.object(new.changed, "wait", wait):
+            reply = new.poll(waiting["id"])
+        self.assertEqual((reply["granted"], reply["position"]), (False, 1))
+        self.assertNotIn("unknown", reply)
+
+    def test_a_release_sent_to_the_new_daemon_grants_the_next_in_line(self):
+        running = self.job()
+        waiting = self.job(script="b.mjs", tree=WT_A, winpid=200)
+        new = self.successor()
+        self.assertTrue(new.release(running["id"], 0))
+        self.assertIn(waiting["id"], new.leases)
+
+    def test_new_ids_carry_on_from_the_old_ones(self):
+        old = self.job()
+        new = self.successor()
+        self.proc(200, 1, "node.exe")
+        fresh = new.enqueue({"script": "n.mjs", "tree_id": "t", "winpid": 200})
+        self.assertNotEqual(fresh["id"], old["id"])
+        self.assertEqual(new.seq, self.q.seq + 1)
+
+    def test_what_the_old_daemon_was_remembering_crosses_too(self):
+        job = self.job(eta_s=48)
+        self.engine(101, 100, SNAP + "/godot")
+        self.job(script="other.mjs", tree=WT_B, winpid=200, eta_s=30)
+        # Late enough to be watched, not yet idle long enough to be killed.
+        self.run_for(780, {101: 0.2})
+        self.q.parked[("t", "s", "a")] = (self.clock - 50, self.clock - 5, {"cpu": 45.0})
+        self.q.notes["t"] = ("killed", self.clock)
+        self.q.cancelled.add("J99")
+        new = self.successor()
+        # How long the hung lease has sat idle: a restart throws that away,
+        # and the job behind it then waits the whole quiet period again.
+        self.assertEqual(new.stall_samples[job["id"]]["cpu"],
+                         self.q.stall_samples[job["id"]]["cpu"])
+        self.assertEqual(new.leases[job["id"]].get("quiet_since"),
+                         self.q.leases[job["id"]].get("quiet_since"))
+        self.assertEqual(new.parked, self.q.parked)
+        self.assertEqual(new.notes, self.q.notes)
+        self.assertEqual(new.cancelled, {"J99"})
+
+    def test_a_long_poll_comes_back_still_queued_when_the_daemon_lets_go(self):
+        self.job()
+        waiting = self.job(script="b.mjs", tree=WT_A, winpid=200)
+        self.q.handing_over = True
+        reply = self.q.poll(waiting["id"])
+        self.assertEqual((reply["granted"], reply["position"]), (False, 1))
+        # Old bash clients take any `true` in a queued reply for a grant.
+        self.assertNotIn("true", json.dumps(reply))
+
+    def test_nothing_is_granted_or_killed_while_it_lets_go(self):
+        running = self.job()
+        waiting = self.job(script="b.mjs", tree=WT_A, winpid=200)
+        self.q.handing_over = True
+        self.dead.add(100)
+        self.assertFalse(self.q.tick())
+        self.assertIn(running["id"], self.q.leases)
+        self.assertNotIn(waiting["id"], self.q.leases)
+
+    def test_a_daemon_that_has_handed_over_writes_nothing_more(self):
+        self.job()
+        self.q.save_state()
+        with open(testq.state_path(), encoding="utf-8") as fh:
+            before = fh.read()
+        self.q.handed_over = True
+        self.job(script="b.mjs", tree=WT_A, winpid=200)
+        with open(testq.state_path(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), before)
+
+
 # ---------------------------------------------------------------------------
 # Cancel
 # ---------------------------------------------------------------------------

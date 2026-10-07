@@ -157,26 +157,29 @@ function Update-Tray {
   $cap     = $state.capacity.cpu
   $unmanaged = $state.godot.unmanaged
 
-  # A job that has just finished badly is worth one balloon, once.
-  $newest = @($state.history)[0]
-  if ($newest -and $newest.finished -gt $script:LastFinished) {
-    # Killed by the queue itself -- hung, or past its ceiling -- is as much a
-    # failure to hear about as a bad exit, and the only one with no exit code.
-    $killed = ($newest.verdict -eq 'stalled' -or $newest.verdict -eq 'overran')
-    $bad = $killed -or ($newest.verdict -eq 'released' -and $newest.exit -ne 0)
-    if ($script:LastFinished -gt 0 -and $bad) {
-      if ($killed) {
-        $notify.BalloonTipTitle = "$($newest.script) $($newest.arg) killed: $($newest.verdict)"
-        $notify.BalloonTipText  = "it was holding up the queue, in $($newest.tree)"
-      } else {
-        $notify.BalloonTipTitle = "$($newest.script) $($newest.arg) failed"
-        $notify.BalloonTipText  = "exit $($newest.exit) in $($newest.tree)"
-      }
+  # A balloon is for a run that never got to give its verdict: killed by the
+  # queue, or an engine that crashed under it. The daemon says which those are
+  # (`alert`). A test that failed is not one -- that is the test working, its
+  # owner has the output, and a busy day has hundreds. It gets the red dot.
+  #
+  # Everything that finished since the last look, not only the newest row:
+  # several runs end inside one interval, and a kill behind a pass was missed.
+  $fresh = @($state.history | Where-Object { $_.finished -gt $script:LastFinished })
+  if ($fresh.Count -gt 0) {
+    $newest = $fresh[0]
+    $alerts = @($fresh | Where-Object { $_.alert })
+    if ($script:LastFinished -gt 0 -and $alerts.Count -gt 0) {
+      $a = $alerts[0]
+      $text = "in $($a.tree)"
+      if ($alerts.Count -gt 1) { $text += ", and $($alerts.Count - 1) more" }
+      $notify.BalloonTipTitle = Short "$($a.script) $($a.arg) $($a.alert)" 63
+      $notify.BalloonTipText  = $text
       $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
       $notify.ShowBalloonTip(6000)
     }
     $script:LastFinished = $newest.finished
-    $script:RecentlyFailed = $bad
+    $script:RecentlyFailed = [bool]$newest.alert -or
+      ($newest.verdict -eq 'released' -and $newest.exit -ne 0)
   }
 
   if ($running -eq 0 -and $queued -eq 0) {
