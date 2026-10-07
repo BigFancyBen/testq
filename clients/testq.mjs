@@ -39,7 +39,12 @@ const MODE = process.env.TESTQ || 'on';
 const AUTOSTART = process.env.TESTQ_AUTOSTART !== '0';
 
 /** A no-op slot, so callers never have to branch on whether queueing happened. */
-const UNQUEUED = { queued: false, boxEngines: 0, release() {} };
+const UNQUEUED = { queued: false, boxEngines: 0, slots: 0, release() {} };
+
+// How many times a job asks again after the daemon loses it before it stops
+// asking and runs. See the wait loop in acquire.
+const REQUEUE_LIMIT = 3;
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 const warn = (msg) => process.stderr.write(`!!! ${msg}\n`);
 const say = (msg) => process.stderr.write(`[testq] ${msg}\n`);
@@ -193,6 +198,11 @@ async function startDaemon() {
  * @param {string} [job.project] registry key, for estimates and reap
  * @param {string} [job.treePath] the checkout this runs in (default: cwd)
  * @param {number} [job.slots]   CPU slots, of eight on this box
+ * @param {number} [job.slotsMin] the narrowest this can run on, for a job
+ *   whose engine count FOLLOWS the width it is granted and for no other: the
+ *   daemon may grant anything from here up to `slots` when starting narrow
+ *   answers sooner. Read the width back from `slot.slots` and launch that
+ *   many engines. It is 0 when nobody said (unqueued): use what you asked for.
  * @param {number} [job.gpu]     1 if it opens a window
  *   (two fit at once); the `capacity.gpu` in /state, or anything above it, for
  *   the card to itself — a frame time you mean to quote
@@ -208,7 +218,7 @@ async function startDaemon() {
  * @param {boolean} [job.idleOk]    a window that is meant to sit there; the
  *   daemon will not take it for a hang. maxSeconds still applies.
  */
-export async function acquire(job) {
+export async function acquire(job, requeues = 0) {
   if (MODE === 'off') return withDeadline({ ...UNQUEUED }, job);
 
   if (!(await up()) && !(AUTOSTART && (await startDaemon()))) {
@@ -233,6 +243,7 @@ export async function acquire(job) {
       script: job.script,
       arg: job.arg || '',
       slots: job.slots ?? 1,
+      slots_min: job.slotsMin ?? 0,
       gpu: job.gpu ?? 0,
       engines: job.engines ?? 1,
       exclusive: Boolean(job.exclusive),
@@ -272,6 +283,7 @@ export async function acquire(job) {
         queued: true,
         released: false,
         boxEngines: Number(body?.box_engines ?? body?.lease?.box_engines ?? 0),
+        slots: Number(body?.slots ?? body?.lease?.slots ?? 0),
         async release(exitCode) {
           if (this.released) return;
           this.released = true;
@@ -303,15 +315,33 @@ export async function acquire(job) {
     }
   }
 
+  // A daemon that has lost this ticket has been restarted, and a restart is
+  // exactly when everything queued is told so in the same second. Running
+  // unqueued on that news put the whole queue on the box at once, which is
+  // the one thing the queue is for preventing — so ask again, the way the
+  // bash client does. The new ticket picks up this one's waiting time if the
+  // daemon is the same one, and acquire() itself falls back to running
+  // unqueued if there is no daemon left to ask.
+  const requeue = (why) => {
+    if (requeues >= REQUEUE_LIMIT) {
+      warn(`${why} ${requeues + 1} times — running UNQUEUED`);
+      return withDeadline({ ...UNQUEUED }, job);
+    }
+    say(`${why} — re-queueing`);
+    return acquire(job, requeues + 1);
+  };
+
   const startedWaiting = Date.now();
+  let misses = 0;
   for (;;) {
     const poll = await post('wait', { ticket }, 40000);
     if (poll.status !== 200) {
-      // The daemon went away mid-wait. Its slots went with it, so there is
-      // nothing left to be polite about.
-      warn('testq stopped answering — running UNQUEUED');
-      return withDeadline({ ...UNQUEUED }, job);
+      misses += 1;
+      if (misses >= 3) return requeue('the daemon stopped answering');
+      await sleep(2000);
+      continue;
     }
+    misses = 0;
     const waited = Math.round((Date.now() - startedWaiting) / 1000);
     if (poll.body.granted) {
       say(`got the box after ${waited}s — starting`);
@@ -321,10 +351,7 @@ export async function acquire(job) {
       warn('cancelled from the testq page before it started');
       process.exit(130);
     }
-    if (poll.body.unknown) {
-      warn('the daemon forgot this ticket — running UNQUEUED');
-      return withDeadline({ ...UNQUEUED }, job);
-    }
+    if (poll.body.unknown) return requeue('the daemon forgot this ticket');
     const starts = startsIn(poll.body);
     say(
       `still queued at position ${poll.body.position || '?'} after ${waited}s — ` +

@@ -10,6 +10,7 @@ watch what the daemon would do about it over twenty simulated minutes.
 
 import atexit
 import io
+import json
 import os
 import shutil
 import sys
@@ -622,12 +623,146 @@ class Parked(Box):
         again = self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=400)
         self.assertNotIn("resumed_s", again)
 
+    def test_a_restarted_daemon_keeps_the_places(self):
+        holder = self.job(winpid=100, eta_s=1000)
+        self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=200, eta_s=100)
+        self.run_for(400)
+        self.q.save_state()
+        self.clock += 10
+        self.q = testq.Queue(dict(testq.CAPACITY, gpu=self.GPUS))
+        self.assertTrue(self.running(holder))
+        rival = self.job(script="clip.sh", arg="gates", tree=WT_B, winpid=300, eta_s=100)
+        again = self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=400, eta_s=100)
+        self.assertEqual(again["resumed_s"], 410.0)
+        self.assertEqual(again["waits"], {"gpu": 400.0, "away": 10.0})
+        self.assertEqual([t["id"] for t in self.q.order()], [again["id"], rival["id"]])
+
     def test_a_cancelled_ticket_is_not_parked(self):
         self.job(winpid=100, eta_s=1000)
         first = self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=200)
         self.q.cancel(first["id"])
         again = self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=400)
         self.assertNotIn("resumed_s", again)
+
+
+class Exclusive(Box):
+    """run_mp wants the box to itself, and there is nearly always an engine
+    on it that the queue did not start."""
+
+    def stray(self):
+        self.engine(900, 1, PROG + "/godot")
+        self.run_for(20, rates={900: 1.0})
+
+    def mp(self, **more):
+        return self.job(script="run_mp.sh", arg="30", tree=WT_A, winpid=200,
+                        gpu=0, exclusive=True, engines=2, **more)
+
+    def test_an_engine_outside_the_queue_is_waited_out_and_no_longer(self):
+        self.stray()
+        mp = self.mp()
+        self.run_for(testq.EXCLUSIVE_STRAY_PATIENCE - 20, rates={900: 1.0})
+        self.assertFalse(self.running(mp))
+        self.assertEqual(mp["blocked_on"],
+                         "waiting for a quiet box -- 1 unmanaged engine(s)")
+        self.run_for(30, rates={900: 1.0})
+        self.assertTrue(self.running(mp))
+
+    def test_and_the_box_is_not_emptied_for_it_meanwhile(self):
+        self.stray()
+        mp = self.mp()
+        check = self.job(script="run_check.sh", tree=WT_B, winpid=300, gpu=0)
+        self.assertTrue(self.running(check))
+        self.assertFalse(self.running(mp))
+
+    def test_until_its_patience_runs_out(self):
+        self.stray()
+        mp = self.mp()
+        check = self.job(script="run_check.sh", tree=WT_B, winpid=300, gpu=0)
+        self.engine(301, 300, WT_B)
+        self.run_for(testq.EXCLUSIVE_STRAY_PATIENCE + 10, rates={900: 1.0, 301: 1.0})
+        later = self.job(script="run_test.sh", tree=SNAP, winpid=400, gpu=0)
+        self.assertFalse(self.running(later))
+        del self.table[301]
+        self.q.release(check["id"], 0)
+        self.assertTrue(self.running(mp))
+        self.assertFalse(self.running(later))
+
+    def test_a_quiet_box_is_drained_for_it_at_once(self):
+        first = self.job(script="run_test.sh", winpid=100, gpu=0, eta_s=100)
+        mp = self.mp(eta_s=30)
+        later = self.job(script="run_check.sh", tree=WT_B, winpid=300, gpu=0, eta_s=60)
+        self.assertFalse(self.running(later))
+        self.q.release(first["id"], 0)
+        self.assertTrue(self.running(mp))
+        self.assertFalse(self.running(later))
+
+
+class WaitedOn(Box):
+    """What each queued second was for, which is what goes in the history."""
+
+    def test_the_gpu(self):
+        first = self.job(winpid=100)
+        second = self.job(script="b.mjs", winpid=200)
+        self.run_for(60)
+        self.q.release(first["id"], 0)
+        self.assertEqual(second["waits"], {"gpu": 60.0})
+        self.q.release(second["id"], 0)
+        self.assertEqual(json.loads(self.q.history[-1]["waited_on"]), {"gpu": 60.0})
+
+    def test_a_job_that_did_not_wait_has_nothing_to_say(self):
+        first = self.job(winpid=100)
+        self.q.release(first["id"], 0)
+        self.assertIsNone(self.q.history[-1]["waited_on"])
+
+    def test_engines_outside_the_queue(self):
+        rates = {}
+        for pid in range(900, 900 + testq.CAPACITY["cpu"]):
+            self.engine(pid, 997, WT_B)
+            rates[pid] = 1.0
+        self.run_for(20, rates=rates)
+        suite = self.job(script="run_test.sh", tree=SNAP, winpid=100, gpu=0)
+        self.assertFalse(self.running(suite))
+        self.assertEqual(suite["blocked_on"],
+                         "waiting for slots -- 8 unmanaged engine(s) on the box")
+        self.run_for(30, rates=rates)
+        self.assertEqual(suite["waits"], {"outside": 30.0})
+        self.assertIn("1 job(s) waiting on engines outside the queue: mfrs/hats x8",
+                      sys.stderr.getvalue())
+
+    def test_a_slot_kept_for_a_job_in_front(self):
+        self.job(script="run_test_par.sh", winpid=100, gpu=0, slots=6)
+        big = self.job(script="big.sh", winpid=200, gpu=0, slots=4, eta_s=10)
+        small = self.job(script="small.sh", winpid=300, gpu=0, slots=1, eta_s=100)
+        self.assertEqual(big["waiting_on"], "slots")
+        self.assertFalse(self.running(small))
+        self.assertEqual(small["blocked_on"],
+                         "waiting behind a job ahead of it in the queue")
+
+    def test_a_retry_brings_its_reasons_with_it(self):
+        self.job(winpid=100, eta_s=1000)
+        self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=200, eta_s=100)
+        self.run_for(400)
+        self.dead.add(200)
+        self.run_for(60)
+        again = self.job(script="clip.sh", arg="hats", tree=WT_A, winpid=400, eta_s=100)
+        self.assertEqual(again["waits"], {"gpu": 400.0, "away": 55.0})
+
+
+class Cancel(Box):
+    def test_a_running_job_is_killed_and_the_next_one_starts(self):
+        first = self.job(tree=WT_A, winpid=40)
+        self.engine(41, 40, WT_A)
+        second = self.job(script="b.mjs", winpid=200)
+        self.assertEqual(self.q.cancel(first["id"]), "cancelled a running job")
+        self.assertEqual(sorted(self.killed), [40, 41])
+        self.assertEqual(self.verdict(first), "cancelled")
+        self.assertTrue(self.running(second))
+
+    def test_it_is_cancelled_whoever_notices_first(self):
+        first = self.job(winpid=40)
+        first["cancelling"] = True                         # the kill is under way
+        self.q.release(first["id"], 137)                   # its exit trap gets in
+        self.assertEqual(self.verdict(first), "cancelled")
 
 
 class StartIn(Box):

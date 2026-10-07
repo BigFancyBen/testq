@@ -308,10 +308,11 @@ class db(object):
             # Added after the table had three thousand rows in it. The other
             # copy of this file on the box names its columns when it inserts,
             # so it neither sees this one nor minds it.
-            try:
-                self.conn.execute("ALTER TABLE runs ADD COLUMN size REAL")
-            except sqlite3.OperationalError:
-                pass
+            for column in ("size REAL", "waited_on TEXT"):
+                try:
+                    self.conn.execute("ALTER TABLE runs ADD COLUMN " + column)
+                except sqlite3.OperationalError:
+                    pass
             MIGRATED.append(True)
         return self.conn
 
@@ -925,9 +926,12 @@ class Queue(object):
         # Not on the lease itself: leases are saved, and a reading from before
         # a restart says nothing about the minute just gone.
         self.stall_samples = {}
-        # (tree, script, arg) -> (enqueued_at, abandoned_at) of a ticket whose
-        # client went away, so a retry can pick its wait back up.
+        # (tree, script, arg) -> (enqueued_at, abandoned_at, waits) of a ticket
+        # whose client went away, so a retry can pick its wait back up.
         self.parked = {}
+        # The outside engines last written to daemon.log for holding a job up,
+        # so the log gets a line when that changes and not one a tick.
+        self.outside_logged = ""
         # tree id -> (text, at): see NOTE_SECONDS.
         self.notes = {}
         # Engines no running job accounts for, by worktree, for the page.
@@ -967,14 +971,31 @@ class Queue(object):
                     self.held_mutex[key] = lease["id"]
         self.seq = int(blob.get("seq", 0))
         # Queued tickets are deliberately NOT restored: their clients notice
-        # the dead daemon on their next poll and re-acquire from scratch,
-        # which is simpler than trying to keep two ideas of the queue in step.
+        # the dead daemon on their next poll and re-acquire, which is simpler
+        # than trying to keep two ideas of the queue in step. Their places
+        # are, though, the same way a dead client's is: parked, for the
+        # ticket that comes back asking. A restart used to send everything
+        # queued to the back in whatever order it happened to re-ask.
+        left = float(blob.get("saved_at") or 0)
+        for row in blob.get("waiting", []):
+            try:
+                tree, script, arg, enqueued_at, waits = row
+                key = (tree, script, arg)
+                if now() - left <= PARK_SECONDS and key not in self.parked:
+                    self.parked[key] = (float(enqueued_at), left, dict(waits))
+            except (TypeError, ValueError):
+                continue
 
     def save_state(self):
         blob = {
             "seq": self.seq,
             "saved_at": now(),
             "leases": list(self.leases.values()),
+            # Earliest first, so of two live copies of one job it is the
+            # longer wait that is kept. See load_state.
+            "waiting": [list(self.park_key(t)) + [t["enqueued_at"],
+                                                  t.get("waits") or {}]
+                        for t in sorted(self.queue, key=lambda t: t["enqueued_at"])],
         }
         tmp = state_path() + ".tmp"
         try:
@@ -1005,15 +1026,15 @@ class Queue(object):
                     "INSERT INTO runs (job_id, tree, tree_path, script, arg,"
                     " slots, gpu, exclusive, engines, exit, verdict, dur_s,"
                     " queued_s, eta_s, observed_max_procs, finished, daemon_sha,"
-                    " size)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " size, waited_on)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (row.get("id"), row.get("tree"), row.get("tree_path", ""),
                      row.get("script"), row.get("arg"), row.get("slots", 0),
                      row.get("gpu", 0), int(bool(row.get("exclusive"))),
                      row.get("engines", 0), row.get("exit"), row.get("verdict"),
                      row.get("dur_s"), row.get("queued_s"), row.get("eta_s"),
                      row.get("observed_max_procs", 0), row.get("finished"),
-                     self.sha, row.get("size")),
+                     self.sha, row.get("size"), row.get("waited_on")),
                 )
         except Exception as exc:
             sys.stderr.write("history write failed: %r\n" % (exc,))
@@ -1125,6 +1146,7 @@ class Queue(object):
                 self.save_state()
                 self.changed.notify_all()
             busy = bool(self.leases or self.queue)
+            self.log_outside()
             suspects = self.stall_suspects()
             overrun = self.ceiling_breaches()
         # Outside the lock: spawning a process is not something to hold the
@@ -1133,6 +1155,28 @@ class Queue(object):
         if suspects or overrun:
             self.rescue_stalled(suspects, overrun)
         return granted
+
+    def log_outside(self):
+        """Write down whose engines are holding a queued job up, when that
+        changes. Holds the lock.
+
+        The history could say that jobs waited and never why. An afternoon of
+        a box that would grant nothing looked, the day after, exactly like an
+        afternoon of a full one, and whose engines they had been was gone
+        with the engines.
+        """
+        held = [t["id"] for t in self.queue if t.get("waiting_on") == "outside"]
+        who = ""
+        if held:
+            who = ", ".join("%s x%d" % (g["tree"], g["engines"] - g["idle"])
+                            for g in self.outside if g["engines"] > g["idle"])
+        if who == self.outside_logged:
+            return
+        self.outside_logged = who
+        if who:
+            sys.stderr.write("%s %d job(s) waiting on engines outside the queue: %s\n"
+                             % (time.strftime("%H:%M:%S"), len(held), who))
+            sys.stderr.flush()
 
     def other_shells(self, lease_id):
         """The pids every other running job is judged by. Holds the lock."""
@@ -1344,9 +1388,10 @@ class Queue(object):
         for ticket in stale:
             self.queue.remove(ticket)
             self.append_history(self.history_row(ticket, None, "abandoned"))
-            self.parked[self.park_key(ticket)] = (ticket["enqueued_at"], now())
-        for key in [k for k, (_, left) in self.parked.items()
-                    if now() - left > PARK_SECONDS]:
+            self.parked[self.park_key(ticket)] = (
+                ticket["enqueued_at"], now(), dict(ticket.get("waits") or {}))
+        for key in [k for k, parked in self.parked.items()
+                    if now() - parked[1] > PARK_SECONDS]:
             del self.parked[key]
         if dead or stale:
             self.save_state()
@@ -1445,9 +1490,15 @@ class Queue(object):
         penalty = min(self.stray, self.capacity["cpu"])
         free_cpu = max(0, self.capacity["cpu"] - used_cpu - penalty)
         free_gpu = max(0, self.capacity["gpu"] - used_gpu)
+        # What is free before the penalty and before anything is held back
+        # for a ticket further up, which is only for saying why a ticket is
+        # waiting: see waiting_on.
+        raw_cpu = self.capacity["cpu"] - used_cpu
+        raw_gpu = self.capacity["gpu"] - used_gpu
 
         granted = []
         reserved_mutexes = set()
+        reserved_cpu = 0
         reserved_gpu = 0
         for ticket in self.order():
             need_cpu, need_gpu = self.need_of(ticket)
@@ -1456,15 +1507,27 @@ class Queue(object):
                 key in self.held_mutex or key in reserved_mutexes for key in mutexes
             )
             fits = (not blocked_mutex) and need_cpu <= free_cpu and need_gpu <= free_gpu
-            # An exclusive job additionally needs the box to itself: no other
-            # lease at all, and no stray engine. run_mp measures inter-process
-            # clock skew, so one windowed clip alongside it is enough to make
-            # its verdict meaningless. Strays are not ours to wait out forever
-            # though -- see EXCLUSIVE_STRAY_PATIENCE.
-            if fits and ticket.get("exclusive"):
+            # An exclusive job needs the box to itself: no other lease at all,
+            # and no stray engine. run_mp measures inter-process clock skew,
+            # so one windowed clip alongside it is enough to make its verdict
+            # meaningless. Strays are not ours to wait out forever though --
+            # see EXCLUSIVE_STRAY_PATIENCE.
+            #
+            # Asked of the leases and not of free_cpu, which is already short
+            # by the strays' penalty: an exclusive job needs every slot, so
+            # with one working engine outside the queue it never fitted, the
+            # patience was never reached, and it sat at the head reserving
+            # the whole box for as long as the stray lived. Sixteen run_mp in
+            # nineteen gave up in the queue that way. Nothing held back for a
+            # ticket ahead of it either, which is what "every slot" was also
+            # checking.
+            outwaiting = False
+            if ticket.get("exclusive"):
                 waited = now() - ticket["enqueued_at"]
                 quiet = self.stray == 0 or waited > EXCLUSIVE_STRAY_PATIENCE
-                fits = not self.leases and quiet
+                fits = (not blocked_mutex and not self.leases and quiet
+                        and not reserved_cpu and not reserved_gpu)
+                outwaiting = not quiet
             if not fits and self.try_shrink(ticket, blocked_mutex, free_cpu,
                                             free_gpu, reserved_gpu > 0):
                 need_cpu, need_gpu = self.need_of(ticket)
@@ -1474,6 +1537,8 @@ class Queue(object):
                 granted.append(ticket["id"])
                 free_cpu -= need_cpu
                 free_gpu -= need_gpu
+                raw_cpu -= need_cpu
+                raw_gpu -= need_gpu
             else:
                 # Head-of-line reservation. What this ticket cannot get yet is
                 # held back from everyone behind it, so a four-slot job is not
@@ -1494,18 +1559,68 @@ class Queue(object):
                 # behind four queued clips with three cores idle.
                 #
                 # An exclusive job is in neither case -- it is waiting for the
-                # whole box -- so it always reserves.
+                # whole box -- so it reserves all of it. Except while it is
+                # still giving the strays their five minutes: it cannot start
+                # before that runs out whatever the queue does, and emptying
+                # the box for it meanwhile is eight slots idle for nothing.
+                # It reserves from the moment the strays go or its patience
+                # does, and the box drains for it then.
+                reason = self.waiting_on(ticket, blocked_mutex, raw_cpu,
+                                         raw_gpu, penalty)
+                self.charge(ticket, reason)
+                ticket["blocked_on"] = self.explain(ticket, reason)
+                if outwaiting:
+                    continue
                 gpu_alone = (not blocked_mutex and need_cpu <= free_cpu
                              and need_gpu > free_gpu)
                 behind_gpu = (need_gpu > 0
                               and reserved_gpu + need_gpu > self.capacity["gpu"])
                 if ticket.get("exclusive") or not (gpu_alone or behind_gpu):
+                    reserved_cpu += need_cpu
                     free_cpu = max(0, free_cpu - need_cpu)
                 reserved_gpu += need_gpu
                 free_gpu = max(0, free_gpu - need_gpu)
                 reserved_mutexes.update(mutexes)
-                ticket["blocked_on"] = self.explain(ticket, blocked_mutex)
         return granted
+
+    def waiting_on(self, ticket, blocked_mutex, raw_cpu, raw_gpu, penalty):
+        """One word for what is keeping this ticket in the queue. Holds the
+        lock.
+
+        `raw_cpu` and `raw_gpu` are what no running job has, with nothing
+        taken off for outside engines or held back for tickets further up.
+        So the order below is the order of blame: what a running job holds
+        first, then what the engines outside the queue cost, and only then
+        the queue's own doing -- `ahead`, which is a slot that is free and
+        being kept for somebody in front.
+        """
+        need_cpu, need_gpu = self.need_of(ticket)
+        if blocked_mutex:
+            return "mutex"
+        if ticket.get("exclusive"):
+            return "outside" if self.stray and not self.leases else "quiet"
+        if need_gpu > raw_gpu:
+            return "gpu"
+        if need_cpu > raw_cpu:
+            return "slots"
+        if need_cpu > raw_cpu - penalty:
+            return "outside"
+        return "ahead"
+
+    def charge(self, ticket, reason):
+        """Book the time since this ticket was last looked at to `reason`.
+        Holds the lock.
+
+        This is what the history was missing. A week of it said jobs had
+        queued for a hundred and twenty hours and nothing about why, and the
+        answer -- that most of it was not behind another job at all -- had to
+        be reconstructed from start and finish times.
+        """
+        waits = ticket.setdefault("waits", {})
+        mark = ticket.get("wait_mark") or now()
+        waits[reason] = round(waits.get(reason, 0.0) + max(0.0, now() - mark), 1)
+        ticket["wait_mark"] = now()
+        ticket["waiting_on"] = reason
 
     def eta_until_free(self, want_more, gpu_line=False):
         """A rough time until `want_more` further cpu slots come free, off the
@@ -1575,19 +1690,20 @@ class Queue(object):
         ticket["eta_s"] = round(work / grant, 1)
         return True
 
-    def explain(self, ticket, blocked_mutex):
-        if blocked_mutex:
+    def explain(self, ticket, reason):
+        """waiting_on's word as the sentence a queued client prints."""
+        if reason == "mutex":
             return "waiting for " + ", ".join(ticket.get("mutexes", []))
         if ticket.get("exclusive"):
             if self.stray:
                 return "waiting for a quiet box -- %d unmanaged engine(s)" % self.stray
             return "waiting for a quiet box"
-        if int(ticket.get("gpu", 0)) > 0:
-            used_gpu = sum(self.need_of(l)[1] for l in self.leases.values())
-            if used_gpu + int(ticket.get("gpu", 0)) > self.capacity["gpu"]:
-                return "waiting for the GPU"
-        if self.stray:
+        if reason == "gpu":
+            return "waiting for the GPU"
+        if reason == "outside":
             return "waiting for slots -- %d unmanaged engine(s) on the box" % self.stray
+        if reason == "ahead":
+            return "waiting behind a job ahead of it in the queue"
         return "waiting for slots"
 
     def box_engines(self, ticket):
@@ -1612,6 +1728,8 @@ class Queue(object):
 
     def activate(self, ticket):
         self.queue.remove(ticket)
+        if ticket.get("waiting_on"):
+            self.charge(ticket, ticket["waiting_on"])
         ticket["granted_at"] = now()
         ticket["pid_ctime"] = process_ctime(ticket.get("winpid"))
         ticket["observed_max_procs"] = self.observed
@@ -1650,6 +1768,8 @@ class Queue(object):
             "queued_s": round((granted or now()) - job["enqueued_at"], 1),
             "eta_s": job.get("eta_s"),
             "size": job.get("size"),
+            # Seconds queued, by what for: see waiting_on.
+            "waited_on": json.dumps(job["waits"]) if job.get("waits") else None,
             "observed_max_procs": job.get("observed_max_procs", 0),
             "finished": now(),
         }
@@ -1658,6 +1778,11 @@ class Queue(object):
         lease = self.leases.pop(lease_id, None)
         if lease is None:
             return False
+        if lease.get("cancelling"):
+            # Its shell is being killed from the page. Whichever notices
+            # first -- the shell's own exit trap, the reaper, or cancel() --
+            # it was cancelled.
+            exit_code, verdict = None, "cancelled"
         self.stall_samples.pop(lease_id, None)
         for key in list(self.held_mutex):
             if self.held_mutex[key] == lease_id:
@@ -1718,6 +1843,7 @@ class Queue(object):
                 "max_s": max_s,
                 "idle_ok": bool(body.get("idle_ok", False)),
                 "blocked_on": "",
+                "wait_mark": now(),
                 "observed_max_procs": 0,
                 "box_engines": 0,
             }
@@ -1734,6 +1860,12 @@ class Queue(object):
                 # what ages it to the front on time.
                 ticket["enqueued_at"] = parked[0]
                 ticket["resumed_s"] = round(now() - parked[0], 1)
+                # And what it had waited for, so the row this one finally
+                # writes accounts for the whole wait. `away` is the gap
+                # between its client dying and asking again.
+                ticket["waits"] = dict(parked[2])
+                ticket["waits"]["away"] = round(
+                    ticket["waits"].get("away", 0.0) + now() - parked[1], 1)
             self.queue.append(ticket)
             self.grant_pass()
             self.save_state()
@@ -1913,24 +2045,31 @@ class Queue(object):
     def cancel(self, job_id):
         with self.lock:
             self.cancelled.add(job_id)
-            if job_id in self.leases:
-                lease = self.leases[job_id]
-                kill_job(lease.get("winpid"), lease.get("tree_path", ""),
-                         self.other_shells(job_id))
-                self.finish(job_id, None, "cancelled")
-                self.grant_pass()
-                self.save_state()
-                self.changed.notify_all()
-                return "cancelled a running job"
-            ticket = next((t for t in self.queue if t["id"] == job_id), None)
-            if ticket is not None:
+            lease = self.leases.get(job_id)
+            if lease is None:
+                ticket = next((t for t in self.queue if t["id"] == job_id), None)
+                if ticket is None:
+                    return None
                 self.queue.remove(ticket)
                 self.append_history(self.history_row(ticket, None, "cancelled"))
                 # Its client is long-polling; tell it the ticket is gone so it
                 # stops waiting instead of sitting there for a minute.
                 self.changed.notify_all()
                 return "removed a queued job"
-            return None
+            lease["cancelling"] = True
+            winpid, tree_path = lease.get("winpid"), lease.get("tree_path", "")
+            spare = self.other_shells(job_id)
+        # Not under the lock, as rescue_stalled's is not: the kill is several
+        # passes with a second between them, and every acquire, poll and
+        # release on the box was waiting behind it. A bash client gives its
+        # acquire ten seconds before it runs unqueued.
+        kill_job(winpid, tree_path, spare)
+        with self.lock:
+            self.finish(job_id, None, "cancelled")
+            self.grant_pass()
+            self.save_state()
+            self.changed.notify_all()
+        return "cancelled a running job"
 
     def snapshot(self):
         with self.lock:
@@ -2712,6 +2851,18 @@ def cmd_tray(args):
     return 0
 
 
+# waiting_on's words, for `stats`.
+WAITED_ON = {
+    "gpu": "the GPU, behind another window",
+    "slots": "a slot, with every one of them taken",
+    "outside": "engines running outside the queue",
+    "ahead": "a free slot being held for a job ahead in the queue",
+    "quiet": "the box to empty, for an exclusive job",
+    "mutex": "a mutex",
+    "away": "its own client, which had died and came back for its place",
+}
+
+
 def cmd_stats(args):
     """What the box has actually been doing, across every session.
 
@@ -2741,6 +2892,23 @@ def cmd_stats(args):
               " %.1f h spent queueing"
               % (args.days, total["n"], (total["ran"] or 0) / 3600.0,
                  (total["eng"] or 0) / 3600.0, (total["waited"] or 0) / 3600.0))
+
+        # Rows from before the queue kept this have nothing in the column
+        # and are left out, so early on the hours here are fewer than the
+        # total above.
+        waited = {}
+        for r in conn.execute("SELECT waited_on FROM runs WHERE " + where +
+                              " AND waited_on IS NOT NULL", params):
+            try:
+                for reason, seconds in json.loads(r["waited_on"]).items():
+                    waited[reason] = waited.get(reason, 0.0) + float(seconds)
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if waited:
+            print("\nwhat the queueing was for:")
+            for reason, seconds in sorted(waited.items(), key=lambda kv: -kv[1]):
+                print("  %7.1f h  %s" % (seconds / 3600.0,
+                                         WAITED_ON.get(reason, reason)))
 
         print("\nby job:")
         print("  %-22s %5s %7s %7s %7s  %s"

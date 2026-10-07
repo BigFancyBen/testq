@@ -161,13 +161,14 @@ work and never exits then holds the GPU until somebody notices. With
 slot back, kills everything it started, and exits 124. The daemon enforces the
 same number as a backstop (see "A run that hangs is killed" below).
 
-Three optional fields say things only the job knows:
+Four optional fields say things only the job knows:
 
 | Field (Node / wire) | Meaning |
 |---|---|
 | `size` / `size` | How much work this is, in whatever the job counts in — seconds to record, scenarios to shoot. The estimate is fitted to it. |
 | `maxSeconds` / `max_s` | The longest this may run once it starts. |
 | `idleOk` / `idle_ok` | A window that is meant to sit there. It will not be taken for a hang; `maxSeconds` still applies. |
+| `slotsMin` / `slots_min` | The narrowest a job can run on, for one whose engine count follows the width it is granted. See "Flexible width". |
 
 **Bash** — there is no bash client in this repository yet. The one in use is
 mfrs's `run_lib.sh`, whose `testq_acquire` / `testq_release` speak the same
@@ -195,6 +196,13 @@ or give up and run outside the queue, which is worse for everybody. Now the
 same job (worktree, script, arg) asking again within fifteen minutes gets its
 waiting time back, which is what orders the queue and what ages a ticket to the
 front. Two live copies of one job are still two jobs.
+
+**So does a restart of the daemon.** `start --restart` keeps the running jobs
+and forgets the queue, and every queued client finds that out on its next poll
+and asks again — both clients do; the Node one used to run unqueued instead,
+which put the whole queue on the box in the same second. The places are saved
+with the leases and handed back the same way a dead client's is, so the queue
+comes back in the order it was in.
 
 ### What the grant tells you back
 
@@ -247,10 +255,19 @@ reboots, so it accumulates across sessions.
 
     python testq.py stats --days 7 [--tree NAME]
 
-gives engine hours, time lost to queueing, per-job medians and worst cases,
-per-worktree totals, and — the useful one — a list of jobs that *sometimes*
+gives engine hours, time lost to queueing and **what the queueing was for**,
+per-job medians and worst cases, per-worktree totals, and — the useful one — a list of jobs that *sometimes*
 pass and sometimes do not, which is the expensive kind of problem here and
 easy to miss one run at a time.
+
+Each row's `waited_on` is its queued seconds by reason, as JSON: `gpu` behind
+another window, `slots` with every slot taken, `outside` for engines the queue
+did not start, `ahead` for a free slot being held for a job in front, `quiet`
+for an exclusive job waiting on the box to empty, `mutex`, and `away` for the
+gap in a ticket whose client died and came back. It is there because a week of
+history once said jobs had queued for 120 hours and could not say that most of
+it was not behind another job at all. `daemon.log` gets a line naming the
+worktrees whenever outside engines start holding a job up.
 
 It is a plain SQLite file, so anything can read it:
 
@@ -434,6 +451,20 @@ samples). That one rule also stops a restarted daemon from overgranting on top
 of the previous one's orphans, and it is why the page can show "2 unmanaged
 engines".
 
+**An exclusive job gives them five minutes, and the box is not emptied for
+it meanwhile.** `run_mp` wants no other engine at all, and an engine the queue
+did not start is not the queue's to wait out — so it holds out for a quiet box
+for `EXCLUSIVE_STRAY_PATIENCE` and then runs anyway, leaving the verdict to
+`run_mp`'s own INCONCLUSIVE. That was the intent from the start and it did not
+work: the fit was tested against capacity already docked by the stray, an
+exclusive job needs all of it, so with one working engine outside the queue it
+never fitted and the patience was never reached. It sat at the head reserving
+every slot for as long as the stray lived; sixteen `run_mp` in nineteen gave
+up in the queue. Now the test is "no running job and nothing held for a ticket
+ahead", and while the five minutes run the job reserves nothing — it cannot
+start before they are up, so other work goes past it, and the box drains for
+it from the moment the strays leave or its patience does.
+
 **Unless they are doing nothing.** An outside engine that has burned under a
 tenth of a core for two minutes is listed as idle and docks no slot; it counts
 again on the first reading that shows it working. Twenty-three headless probes
@@ -546,7 +577,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-Eighty tests, standard library only, a couple of seconds. They start no
+Ninety-two tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
