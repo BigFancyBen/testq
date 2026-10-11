@@ -67,9 +67,10 @@ flowchart LR
   PowerShell.
 - **Godot 4**, spotted by image name (`TESTQ_GODOT_MATCH`).
 - **Python 3, standard library only.** The Node client needs Node 18 or later.
-- **Built for one machine and published as it is.** Capacity is a constant near
-  the top of `testq.py` (`CAPACITY`: eight slots, two windows on the GPU), sized
-  for a 16-core box with one card. Change it for yours.
+- **Built for one machine and published as it is.** The default capacity
+  (`CAPACITY` near the top of `testq.py`: eight slots, two windows on the GPU)
+  is sized for a 16-core box with one card. Say your own in `config.json`
+  (below).
 
 The examples throughout name `mfrs`, a Godot game, and `prognosticator`, a DJ
 visuals app. They are the two private projects this was built for, and their
@@ -433,6 +434,26 @@ worktree get a real estimate before it has any history of its own. `root`,
 directories a project has named: a reaper that guesses where scratch lives is a
 reaper that deletes somebody's work.
 
+## config.json
+
+Optional, in the runtime directory. It is how a machine that is not the one
+this was sized for says how big it is:
+
+```json
+{ "capacity": { "cpu": 6, "gpu": 2 } }
+```
+
+`cpu` is the number of slots and `gpu` the number of windows the card takes at
+once; either may be left out, and `gpu` may be `0`. It is read when a daemon
+starts, so apply a change with `python testq.py start --restart`, which
+interrupts nothing. Clients need no change: they read the capacity from
+`/state`. A number that makes no sense is ignored, with a line in
+`daemon.log`, and the default stands.
+
+It is a file and not an environment variable because the daemon is started by
+whichever client asks first, in that client's environment, and the size of the
+box should not depend on which worktree got there.
+
 ## The tray icon
 
 ![The five states of the tray icon: grey idle, blue running, amber waiting, purple unmanaged, red failed](docs/tray-icons.png)
@@ -703,7 +724,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-A hundred and five tests, standard library only, a couple of seconds. They start no
+A hundred and twenty-seven tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over

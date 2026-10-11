@@ -1151,6 +1151,54 @@ class RuntimeDir(unittest.TestCase):
         self.assertTrue(os.path.isdir(self.legacy))
 
 
+class Capacity(unittest.TestCase):
+    """The size of the box is this machine's to say, in config.json."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="testq-config-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        patch = mock.patch.dict(os.environ, {"TESTQ_HOME": self.home})
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(sys, "stderr", io.StringIO())
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def config(self, text):
+        with open(os.path.join(self.home, "config.json"), "w") as fh:
+            fh.write(text)
+
+    def test_no_file_is_the_defaults(self):
+        self.assertEqual(testq.load_capacity(), testq.CAPACITY)
+
+    def test_a_machine_says_its_own(self):
+        self.config('{"capacity": {"cpu": 6, "gpu": 1}}')
+        self.assertEqual(testq.load_capacity(), {"cpu": 6, "gpu": 1})
+
+    def test_one_number_leaves_the_other(self):
+        self.config('{"capacity": {"cpu": 6}}')
+        self.assertEqual(testq.load_capacity(),
+                         dict(testq.CAPACITY, cpu=6))
+
+    def test_a_box_with_no_card(self):
+        self.config('{"capacity": {"gpu": 0}}')
+        self.assertEqual(testq.load_capacity()["gpu"], 0)
+
+    def test_a_typo_cannot_stop_the_queue(self):
+        for text in ('{"capacity": {"cpu": 0}}', '{"capacity": {"cpu": "6"}}',
+                     '{"capacity": {"cpu": 6.5}}', '{"capacity": {"cpu": true}}',
+                     '{"capacity": {"gpu": -1}}', '{"capacity": 6}',
+                     '[6, 2]', '{"capacity": {"cpu": 6,}}', ''):
+            self.config(text)
+            self.assertEqual(testq.load_capacity(), testq.CAPACITY, text)
+
+    def test_the_queue_grants_to_it(self):
+        self.config('{"capacity": {"cpu": 3}}')
+        q = testq.Queue(testq.load_capacity())
+        self.assertEqual(q.capacity["cpu"], 3)
+        self.assertEqual(testq.CAPACITY["cpu"], 8)
+
+
 class RequestAllowed(unittest.TestCase):
     """Who may talk to the daemon: its clients and its own page, not a
     website that happens to be open in the browser on the same machine."""
