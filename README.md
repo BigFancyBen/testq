@@ -219,9 +219,12 @@ The flags are the same fields (`--cpu`, `--min-cpu`, `--gpu`, `--engines`,
 `$TESTQ_SLOTS` and `$TESTQ_BOX_ENGINES`. Put the `timeout` round each engine
 and never round the script, so that time spent queued is charged to nothing.
 Progress is `testq_progress DONE [TOTAL] [UNIT]`, rate-limited the same way
-and sent in the background; a harness whose engine prints a line per unit of
-work can count them in its log from a background loop, which is what
-Oathkeep's `run_test.sh` does with its `[ok]`/`[FAILED]` lines.
+and sent in the background. **Do not count lines in the engine's log for
+it**: Godot's stdout reaches a pipe in blocks, so a count read off `tee`'s
+file stands still for minutes and then jumps. Have the engine write
+`done total` to a small file the script names in the environment, and
+forward that from a background loop — Oathkeep's `run_test.sh` and
+`tests/selftest.gd` (`OATH_PROGRESS_FILE`) are a worked example.
 
 Anything else speaks the protocol directly, all JSON, and the two clients
 are the reference for what to send:
