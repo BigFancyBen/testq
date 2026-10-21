@@ -2992,12 +2992,17 @@ function render(s) {
     }
     if (r.quiet_since) return "<span class='bad'>idle " + dur(at - r.quiet_since) + "</span>";
     if (r.cpu_cores == null) return "<span class='tag'>--</span>";
-    return (r.cpu_cores >= 0.5 ? "<span class='ok'>busy</span>" : "<span class='warn'>quiet</span>") +
-      "<span class='tag'> " + r.cpu_cores.toFixed(1) + " cpu</span>";
+    // Half a core is the stall rule's line for working. Under a tenth is an
+    // engine doing nothing at all; between is a test awaiting frames, and also
+    // a hung window, which is why it gets no colour either way.
+    const word = r.cpu_cores >= 0.5 ? "<span class='ok'>busy</span>"
+      : r.cpu_cores >= 0.1 ? "<span>light</span>" : "<span class='warn'>quiet</span>";
+    return word + "<span class='tag'> " + r.cpu_cores.toFixed(1) + " cpu</span>";
   }
   function progress(r, el) {
     const eta = r.eta_now_s || r.eta_s;
-    const label = eta ? "~" + dur(eta) + (r.busy ? ", busy box" : "") : "";
+    // A count with a total says how long is left better than any estimate.
+    const label = eta && !r.progress_total ? "~" + dur(eta) + (r.busy ? ", busy box" : "") : "";
     const title = r.busy ? ' title="estimate ' + dur(r.eta_s) + ', measured with ' +
       (r.eta_load || 1) + ' engine(s) on the box; ' + r.load_avg + ' on it now"' : "";
     const unit = r.progress_unit ? " " + esc(r.progress_unit) : "";

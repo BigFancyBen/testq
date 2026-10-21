@@ -407,10 +407,12 @@ time out of WMI twice, a minute apart. Now the State column says it:
 - `working`, for a job whose reported count moved in the last two minutes,
   and `no progress 6m of 15m00s` once it has stood still — amber, then red
   past half its stall window.
-- For a job that reports nothing, `busy 1.0 cpu` or `quiet 0.1 cpu`: the
-  cores its shell and its worktree's engines burned over the last ten
-  seconds, off the process table the daemon reads anyway. Once a late job is
-  being watched for a hang it says `idle 4m` instead, as before.
+- For a job that reports nothing, the cores its shell and its worktree's
+  engines burned over the last ten seconds, off the process table the daemon
+  reads anyway: `busy 1.0 cpu` from half a core, `quiet 0.0 cpu` under a
+  tenth, and `light 0.2 cpu` between — a test awaiting frames idles there, and
+  so does a hung window, so a job that stays there is one to watch. Once a
+  late job is being watched for a hang it says `idle 4m` instead, as before.
 
 The Progress column is driven by the job's count when it reports one —
 `2,310 / 3,104 rows · ~9m left`, the time left off its own pace so far — and
