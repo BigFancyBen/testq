@@ -564,6 +564,228 @@ class Ceiling(Box):
         self.assertEqual(self.verdict(job), "overran")
 
 
+class Progress(Box):
+    """A job that says how far it has got is judged by that, not its cpu."""
+
+    def suite(self, **more):
+        job = self.job(script="run_test.sh", arg="all", eta_s=48, **more)
+        self.engine(101, 100, SNAP + "/godot")
+        return job
+
+    def waiter(self):
+        return self.job(script="other.mjs", tree=WT_B, winpid=200, eta_s=30)
+
+    def run_reporting(self, job, seconds, rate, cpu, every=30):
+        """Run for `seconds`, reporting `rate` more rows every `every`."""
+        done = job.get("progress_done") or 0
+        end = self.clock + seconds
+        while self.clock < end:
+            self.run_for(every, {101: cpu})
+            done += rate
+            self.q.progress(job["id"], done, 3104, "rows")
+
+    def test_a_count_that_moves_is_never_stalled_however_idle_it_looks(self):
+        # Under the cpu rule this is the 5 October hang, killed at 15 minutes.
+        job, _ = self.suite(), self.waiter()
+        self.run_reporting(job, 3000, 20, 0.2)
+        self.assertTrue(self.running(job))
+        self.assertEqual(self.killed, [])
+
+    def test_a_count_that_stops_is_stalled_however_busy_it_looks(self):
+        # A row spinning in a loop: a whole core, and no row ever finishes.
+        job, waiter = self.suite(), self.waiter()
+        self.q.progress(job["id"], 212, 3104, "rows")
+        self.run_for(890, {101: 1.5})
+        self.assertTrue(self.running(job))
+        self.run_for(20, {101: 1.5})
+        self.assertEqual(self.verdict(job), "stalled")
+        self.assertEqual(sorted(self.killed), [100, 101])
+        self.assertTrue(self.running(waiter))
+        note = self.q.note_for(job["tree_id"])
+        self.assertIn("no progress for", note)
+        self.assertIn("at 212 of 3104 rows", note)
+        self.assertIn("stall_s", note)
+
+    def test_reports_that_repeat_the_count_are_not_movement(self):
+        job, _ = self.suite(), self.waiter()
+        self.run_reporting(job, 1000, 0, 1.5)
+        self.assertEqual(self.verdict(job), "stalled")
+
+    def test_nobody_waiting_nobody_killed(self):
+        job = self.suite()
+        self.q.progress(job["id"], 212, 3104)
+        self.run_for(3000, {101: 0.2})
+        self.assertTrue(self.running(job))
+
+    def test_a_client_can_give_its_rows_longer(self):
+        job, _ = self.suite(stall_s=1800), self.waiter()
+        self.q.progress(job["id"], 212, 3104)
+        self.run_for(1700, {101: 1.5})
+        self.assertTrue(self.running(job))
+        self.run_for(200, {101: 1.5})
+        self.assertEqual(self.verdict(job), "stalled")
+
+    def test_idle_ok_is_still_left_to_sit(self):
+        job, _ = self.suite(idle_ok=True), self.waiter()
+        self.q.progress(job["id"], 212, 3104)
+        self.run_for(3000, {101: 0.2})
+        self.assertTrue(self.running(job))
+
+    def test_a_count_that_moves_is_still_stopped_at_its_ceiling(self):
+        job, _ = self.suite(max_s=1200), self.waiter()
+        self.run_reporting(job, 1300, 20, 1.0)
+        self.assertEqual(self.verdict(job), "overran")
+
+    def test_until_it_reports_it_is_judged_by_its_cpu(self):
+        job, _ = self.suite(), self.waiter()
+        self.run_for(1200, {101: 0.2})
+        self.assertEqual(self.verdict(job), "stalled")
+
+    def test_a_count_going_down_has_started_something_new(self):
+        job, _ = self.suite(), self.waiter()
+        self.q.progress(job["id"], 3104, 3104)
+        self.run_for(800, {101: 1.0})
+        self.q.progress(job["id"], 3, 40)
+        self.run_for(800, {101: 1.0})
+        self.assertTrue(self.running(job))
+
+    def test_a_lease_nobody_has_is_refused(self):
+        self.assertFalse(self.q.progress("J999", 1, 2))
+        self.assertEqual(testq.progress_reply(self.q, {"lease": "J999", "done": 1})[0], 404)
+        self.assertEqual(testq.progress_reply(self.q, {"lease": "J1", "done": "x"})[0], 400)
+
+    def test_the_reply_says_no_true_to_an_old_bash_client(self):
+        job = self.suite()
+        code, reply = testq.progress_reply(
+            self.q, {"lease": job["id"], "done": 5, "total": 9, "unit": "rows"})
+        self.assertEqual((code, reply), (200, {"progress": 1}))
+        self.assertNotIn("true", json.dumps(reply))
+
+    def test_it_rides_on_the_snapshot_and_crosses_a_handover(self):
+        job = self.suite()
+        self.q.progress(job["id"], 2310, 3104, "rows")
+        row = self.q.snapshot()["running"][0]
+        self.assertEqual((row["progress_done"], row["progress_total"],
+                          row["progress_unit"]), (2310, 3104, "rows"))
+        self.assertEqual(row["stall_window_s"], testq.PROGRESS_STALL_SECONDS)
+        heir = testq.Queue(dict(testq.CAPACITY, gpu=1),
+                           inherited=json.loads(json.dumps(self.q.export_state())))
+        self.assertEqual(heir.leases[job["id"]]["progress_done"], 2310)
+        self.assertEqual(heir.progress_stalls(), [])
+
+    def test_status_says_how_far_and_whether_it_moves(self):
+        job = self.suite()
+        self.q.progress(job["id"], 2310, 3104, "rows")
+        state = self.q.snapshot()
+        aside = testq.run_aside(state["running"][0], state["now"])
+        self.assertIn("2,310 / 3,104 rows", aside)
+        self.assertIn("working", aside)
+        self.clock += 400
+        state = self.q.snapshot()
+        self.assertIn("no progress 6m40s", testq.run_aside(state["running"][0], state["now"]))
+
+
+class BusyBox(Box):
+    """An estimate is stretched by how much busier the box is than it was."""
+
+    def ran(self, seconds, load_avg=None, max_procs=1):
+        self.q.append_history({
+            "id": "J0", "tree": "t", "script": "run_test.sh", "arg": "all",
+            "exit": 0, "verdict": "released", "dur_s": seconds, "queued_s": 0,
+            "observed_max_procs": max_procs, "load_avg": load_avg,
+            "finished": self.clock})
+        self.clock += 1
+
+    def suite(self):
+        return self.job(script="run_test.sh", arg="all", tree_id="t", gpu=0)
+
+    def crowd(self, n):
+        """n engines on the box that are not this job's."""
+        for i in range(n):
+            self.engine(500 + i, 1, WT_B + str(i), cpu=0.0)
+
+    def test_a_quiet_box_leaves_the_estimate_alone(self):
+        for _ in range(3):
+            self.ran(2460, load_avg=1.0)
+        job = self.suite()
+        self.run_for(30)
+        self.assertEqual(self.q.eta_now(job), 2460)
+        self.assertEqual(self.q.snapshot()["running"][0]["busy"], 0)
+
+    def test_five_engines_on_a_box_measured_at_one_is_longer(self):
+        for _ in range(3):
+            self.ran(2460, load_avg=1.0)
+        job = self.suite()
+        self.engine(101, 100, SNAP + "/godot")
+        self.crowd(4)
+        self.run_for(60)
+        self.assertAlmostEqual(self.q.contention(job), 1.4)
+        row = self.q.snapshot()["running"][0]
+        self.assertEqual(row["eta_now_s"], 3444)
+        self.assertEqual(row["busy"], 1)
+        state = self.q.snapshot()
+        self.assertIn("busy box, was ~41m00s", testq.run_aside(row, state["now"]))
+
+    def test_measured_on_a_busy_box_it_is_not_stretched_again(self):
+        for _ in range(3):
+            self.ran(3444, load_avg=5.0)
+        job = self.suite()
+        self.engine(101, 100, SNAP + "/godot")
+        self.crowd(4)
+        self.run_for(60)
+        self.assertAlmostEqual(self.q.contention(job), 1.0)
+
+    def test_nor_shrunk_on_a_quieter_one(self):
+        for _ in range(3):
+            self.ran(3444, load_avg=5.0)
+        job = self.suite()
+        self.run_for(60)
+        self.assertEqual(self.q.contention(job), 1.0)
+
+    def test_old_rows_are_read_at_the_most_they_saw(self):
+        for _ in range(3):
+            self.ran(2460, max_procs=3)
+        self.assertEqual(self.q.history_load("run_test.sh", "all", "t"), 3)
+
+    def test_a_run_records_the_load_it_ran_under(self):
+        job = self.suite()
+        self.engine(101, 100, SNAP + "/godot")
+        self.crowd(2)
+        self.run_for(60)
+        self.q.release(job["id"], 0)
+        with testq.db() as conn:
+            row = conn.execute("SELECT load_avg FROM runs WHERE job_id=?",
+                               (job["id"],)).fetchone()
+        self.assertAlmostEqual(row["load_avg"], 3.0, delta=0.3)
+
+    def test_a_slow_box_does_not_make_a_slow_run_a_suspect(self):
+        # 400 s measured alone, on a box now carrying twenty: 1160 s there,
+        # so suspected at three times that and not at three times 400.
+        for _ in range(3):
+            self.ran(400, load_avg=1.0)
+        job = self.suite()
+        self.engine(101, 100, SNAP + "/godot")
+        self.crowd(19)
+        self.run_for(30)
+        self.clock += 1300
+        self.assertEqual(self.q.stall_suspects(), [])
+        self.clock += 2300
+        self.assertEqual(self.q.stall_suspects(), [job["id"]])
+
+
+class CpuOnThePage(Box):
+    def test_a_running_job_says_what_it_burns(self):
+        job = self.job(eta_s=48)
+        self.engine(101, 100, SNAP + "/godot")
+        self.run_for(60, {101: 1.0})
+        row = self.q.snapshot()["running"][0]
+        self.assertAlmostEqual(row["cpu_cores"], 1.0, delta=0.1)
+        self.run_for(60, {101: 0.0})
+        self.assertEqual(self.q.snapshot()["running"][0]["cpu_cores"], 0.0)
+        self.assertIn("0.0 cpu", testq.run_aside(self.q.snapshot()["running"][0], self.clock))
+        self.assertTrue(self.running(job))
+
+
 # ---------------------------------------------------------------------------
 # Counting the box
 # ---------------------------------------------------------------------------
