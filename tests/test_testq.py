@@ -742,6 +742,17 @@ class BusyBox(Box):
         self.run_for(60)
         self.assertEqual(self.q.contention(job), 1.0)
 
+    def test_a_lease_from_an_older_daemon_looks_its_history_up(self):
+        for _ in range(3):
+            self.ran(3444, load_avg=5.0)
+        job = self.suite()
+        del job["eta_load"]
+        self.engine(101, 100, SNAP + "/godot")
+        self.crowd(4)
+        self.run_for(60)
+        self.assertAlmostEqual(self.q.contention(job), 1.0)
+        self.assertEqual(job["eta_load"], 5.0)
+
     def test_old_rows_are_read_at_the_most_they_saw(self):
         for _ in range(3):
             self.ran(2460, max_procs=3)

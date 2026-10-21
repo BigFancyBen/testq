@@ -1379,6 +1379,10 @@ class Queue(object):
         says: 1.0 or more. See CONTENTION_PER_ENGINE."""
         def cost(engines):
             return 1.0 + CONTENTION_PER_ENGINE * max(0.0, float(engines) - 1.0)
+        if "eta_load" not in lease:
+            # Granted by a daemon from before eta_load, and handed over.
+            lease["eta_load"] = self.history_load(
+                lease.get("script", ""), lease.get("arg", ""), lease.get("tree_id", ""))
         measured = lease.get("eta_load") or 1.0
         return max(1.0, cost(self.load_of(lease)) / cost(measured))
 

@@ -802,7 +802,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-A hundred and forty-two tests, standard library only, a few seconds. They start no
+A hundred and forty-three tests, standard library only, a few seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
