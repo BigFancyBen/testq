@@ -1956,39 +1956,58 @@ class Queue(object):
             return other_cpu <= free_cpu < other_cpu + need_cpu
         return False
 
-    def head_start(self, reserved_min, penalty):
+    def head_start(self, reserved_min, reserved_smin, penalty, gpu_line=False):
         """When the reservations ahead could be met, and what is spare then.
-        Holds the lock. Returns (seconds from now, cpu slots left over once
-        they are met).
+        Holds the lock. Returns (seconds from now, cpu slots left over).
 
-        Off the running leases' own estimates, the same floors as
-        eta_until_free (15 s for a lease already past its estimate) except
-        that a lease with NO estimate also counts as ending in 15 s, not in
-        twenty-three days: it could end any second, and a job that backfilled
-        on the strength of its not ending would be sitting in the slot the
-        head is waiting for. The seconds are inf when the leases never free
-        enough (the head is waiting on something else), and `spare` is
-        what is left of the freed slots after the head has its own.
+        Two projections, deliberately not the same. The SECONDS assume a
+        lease with no estimate ends in 15 s, not in twenty-three days: it
+        could end any second, so a job that backfilled on the strength of its
+        not ending would sit in the slot the head waits for. That is the
+        conservative direction for a time. For `spare` it is the optimistic
+        one -- a no-estimate backfiller would itself be counted as freeing
+        its slot on the next pass, spare would never shrink, and the head
+        could end up waiting on blind jobs for hours -- so spare counts only
+        leases that HAVE an estimate, at the moment estimates alone give the
+        head its slots.
+
+        Mirrors eta_until_free: with `gpu_line` a windowed lease's slot goes
+        to the next windowed job, not to the head, so it frees nothing. The
+        seconds use the head's `slots_min` (a flexible head may shrink and
+        start earlier); spare uses what it asked for.
         """
         used = sum(self.need_of(l)[0] for l in self.leases.values())
-        freed = max(0, self.capacity["cpu"] - used - penalty)
+        avail = max(0, self.capacity["cpu"] - used - penalty)
         rel = []
         for l in self.leases.values():
+            if gpu_line and self.need_of(l)[1] > 0:
+                continue
             eta = l.get("eta_s")
-            remaining = 15.0 if eta is None else max(
+            left = None if eta is None else max(
                 15.0, float(eta) - (now() - float(l.get("granted_at") or now())))
-            rel.append((remaining, self.need_of(l)[0]))
+            rel.append((15.0 if left is None else left, left is not None,
+                        self.need_of(l)[0]))
         rel.sort()
-        if freed >= reserved_min:
-            return 0.0, freed - reserved_min
-        for remaining, slots in rel:
-            freed += slots
-            if freed >= reserved_min:
-                return remaining, freed - reserved_min
-        return float("inf"), 0
+
+        def when(need, estimated_only):
+            freed = avail
+            if freed >= need:
+                return 0.0, freed - need
+            usable = [x for x in rel if x[1] or not estimated_only]
+            for i, (remaining, known, slots) in enumerate(usable):
+                freed += slots
+                if freed >= need:
+                    # Everything ending at this same moment is free by then,
+                    # whatever order the sort put it in.
+                    freed += sum(sl for r, k, sl in usable[i + 1:]
+                                 if r == remaining)
+                    return remaining, freed - need
+            return float("inf"), 0
+
+        return when(reserved_smin, False)[0], when(reserved_min, True)[1]
 
     def can_backfill(self, ticket, blocked_mutex, avail_cpu, free_gpu,
-                     reserved_min, penalty):
+                     reserved_min, reserved_smin, penalty, gpu_line=False):
         """Whether `ticket` may start now in capacity a reserving job ahead
         of it is holding, without delaying that job. Holds the lock.
 
@@ -2011,11 +2030,15 @@ class Queue(object):
         need_cpu, need_gpu = self.need_of(ticket)
         if need_cpu > avail_cpu or need_gpu > free_gpu:
             return False
-        shadow, spare = self.head_start(reserved_min, penalty)
+        shadow, spare = self.head_start(reserved_min, reserved_smin, penalty,
+                                        gpu_line)
         if need_cpu <= spare:
             return True
+        # Never on an infinite wait (outside engines, or a head wider than the
+        # box can be): nothing says when the head starts, so nothing is safe.
         eta = ticket.get("eta_s")
-        return eta is not None and float(eta) < shadow
+        return (eta is not None and shadow != float("inf")
+                and float(eta) < shadow)
 
     def grant_pass(self):
         used_cpu = sum(self.need_of(l)[0] for l in self.leases.values())
@@ -2035,6 +2058,8 @@ class Queue(object):
         reserved_mutexes = set()
         reserved_cpu = 0
         reserved_gpu = 0
+        reserved_smin = 0      # ... counting a flexible head at slots_min
+        holds = []             # (reserved_min, reserved_smin) after each reserver
         reserved_min = 0       # cpu the tickets ahead hold back, see can_backfill
         draining = False       # an exclusive job is collecting the box
         avail_cpu = free_cpu   # free_cpu before anything was held back
@@ -2085,9 +2110,13 @@ class Queue(object):
             # Backfill: a slot the head is collecting is not idle, but it is
             # not needed until the head can start. See can_backfill.
             backfilled = False
-            if not fits and reserved_min > 0 and not draining and self.can_backfill(
-                    ticket, blocked_mutex, avail_cpu, free_gpu, reserved_min,
-                    penalty):
+            # Every reserver ahead must be safe, not only the sum: a job
+            # that fits inside the last one's wait can still push back the
+            # first, who is waiting for the same slot.
+            if not fits and holds and not draining and all(
+                    self.can_backfill(ticket, blocked_mutex, avail_cpu, free_gpu,
+                                      rm, rs, penalty, reserved_gpu > 0)
+                    for rm, rs in holds):
                 # Windows first, as in gpu_hold: a CPU-only job does not
                 # take the slot a windowed job behind it could use.
                 first = next((o for o in order[index + 1:]
@@ -2096,10 +2125,11 @@ class Queue(object):
                         and not self.is_aged(ticket)
                         and self.gpu_hold(ticket, [first], avail_cpu, free_gpu,
                                           reserved_mutexes)
-                        and self.can_backfill(
+                        and all(self.can_backfill(
                             first, any(k in self.held_mutex or k in reserved_mutexes
                                        for k in first.get("mutexes", [])),
-                            avail_cpu, free_gpu, reserved_min, penalty))
+                            avail_cpu, free_gpu, rm, rs, penalty,
+                            reserved_gpu > 0) for rm, rs in holds))
                 if held:
                     ticket["blocked_on"] = self.explain(ticket, "gpu_hold")
                 else:
@@ -2161,6 +2191,8 @@ class Queue(object):
                         ticket["accruing"] = True          # see gpu_hold
                     reserved_cpu += need_cpu
                     reserved_min += need_cpu
+                    reserved_smin += min(need_cpu, int(ticket.get("slots_min") or need_cpu))
+                    holds.append((reserved_min, reserved_smin))
                     free_cpu = max(0, free_cpu - need_cpu)
                 reserved_gpu += need_gpu
                 free_gpu = max(0, free_gpu - need_gpu)

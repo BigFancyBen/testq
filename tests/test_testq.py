@@ -1490,6 +1490,10 @@ class GpuNotIdle(Box):
 
     def test_a_head_that_is_reserving_keeps_what_frees(self):
         leases = self.fill(8)
+        # Two outlast the rest, so six slots are free at 1000 s with none
+        # to spare.
+        for lease in leases[6:]:
+            lease["eta_s"] = 9000
         wide = self.job(script="run_test_par.sh", winpid=500, gpu=0, slots=6, eta_s=5)
         # Longer than the leases the head waits for, so they would delay it
         # (test_backfill covers the ones that would not).
@@ -1566,7 +1570,7 @@ class Backfill(Box):
             self.assertTrue(self.running(lease))
         return leases
 
-    def head(self, slots=4, eta=30):
+    def head(self, slots=4, eta=30):  # 8 = none spare
         head = self.job(script="run_test.sh", winpid=500, gpu=0, slots=slots,
                         eta_s=eta)
         self.assertFalse(self.running(head))
@@ -1609,7 +1613,7 @@ class Backfill(Box):
 
     def test_a_job_that_would_outlive_the_head_s_wait_does_not_backfill(self):
         self.fill(7)
-        head = self.head()
+        head = self.head(slots=8)
         long = self.shot(0, eta=5000)
         short = self.shot(1, eta=120)
         self.assertFalse(self.running(long))
@@ -1618,7 +1622,7 @@ class Backfill(Box):
 
     def test_a_job_with_no_estimate_does_not_backfill_into_the_heads_slot(self):
         self.fill(7)
-        self.head()
+        self.head(slots=8)
         blind = self.shot(0, eta=None)
         self.assertFalse(self.running(blind))
 
@@ -1641,6 +1645,22 @@ class Backfill(Box):
         self.assertTrue(self.running(blind))
         self.assertTrue(self.running(self.shot(1, eta=9000)))
         self.q.release(big["id"], 0)
+        self.assertTrue(self.running(head))
+
+    def test_blind_backfillers_do_not_count_as_freeing_spare_slots(self):
+        # Capacity 8: a four-slot and a one-slot lease (1000 s), a six-slot
+        # head, three free. Spare at 1000 s is 8-6 = 2: two blind jobs may
+        # sit in it, and the third must not (it would be counted as freeing
+        # on the next pass and the head left waiting on blind jobs).
+        big = self.job(script="big.sh", winpid=300, gpu=0, slots=4, eta_s=1000)
+        one = self.job(script="one.sh", winpid=301, gpu=0, slots=1, eta_s=1000)
+        head = self.job(script="run_test.sh", winpid=500, gpu=0, slots=6, eta_s=30)
+        blinds = [self.job(script="b%d.sh" % i, winpid=700 + i, gpu=0, slots=1,
+                           eta_s=None) for i in range(3)]
+        self.assertEqual([self.running(b) for b in blinds], [True, True, False])
+        self.q.release(big["id"], 0)
+        self.assertFalse(self.running(head))      # the one-slot lease too
+        self.q.release(one["id"], 0)
         self.assertTrue(self.running(head))
 
     def test_a_cpu_job_leaves_the_slot_to_a_shot_when_both_could_backfill(self):
