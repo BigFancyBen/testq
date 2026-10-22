@@ -321,6 +321,44 @@ so a script killed outright — or one whose failure path calls `exit` — costs
 queue nothing. Release explicitly anyway when you can: it is immediate, and it
 records the exit code.
 
+## Practices for clients
+
+The box is shared by every worktree of every project, so what one client does
+costs everyone's queue time. These are the habits that keep it moving, most
+of them learned the hard way:
+
+- **Keep the per-change run small.** The queue's biggest wait is not
+  scheduling, it is a rigid hour-long full suite booked by every worktree for
+  every push. Tier the tests: a change-scoped selection while working and
+  before a PR, the full suite on the main branch now and then (oathkeep:
+  `run_test.sh changed` gates a PR, `all` does not).
+- **Go wide flexibly, not rigidly.** Work that divides (suites, shards,
+  scenarios) should send `slots_min` and launch as many engines as it is
+  granted. Starting narrow when the box is busy beats waiting for four free
+  slots at once, and the daemon does that arithmetic for you.
+- **The cheapest job is the one never queued.** Cache verdicts in the client,
+  keyed by a hash of what the run loads, and share the cache across worktrees:
+  a suite that passed on the same files in another tree has passed here.
+  (oathkeep: `tests/test_cache.py`.)
+- **Report progress.** `testq_progress done total` (or a progress file the
+  wrapper forwards) is how the page tells a slow run from a hung one, and a
+  long job that says nothing looks hung to every agent reading the page.
+- **Time nothing on a shared box.** A wall-clock assertion means something
+  only at `TESTQ_BOX_ENGINES` = 1. A limit that must hold elsewhere scales
+  with that number, and a sharded run counts its own sibling shards.
+- **Stop the engine, not just the wrapper.** Killing a wrapper script (an
+  agent's "stop task", a closed terminal) can leave its Godot running: the
+  daemon reclaims the slot when the client dies, but the orphaned engine keeps
+  its CPU and shows up as unmanaged load. Find it by its `--path` and end it.
+  A wrapper that starts engines in the background should kill them in its
+  exit trap.
+- **Never put your own `timeout` around a queued script.** It counts the queue
+  wait too, and kills the client before it releases (see "What to tell the
+  agents").
+- **One kind of work per arg.** Estimates are the history of (script, arg);
+  an arg that means different amounts of work on different days (a diff-driven
+  selection) estimates badly. Declare `size` when you know it.
+
 ## Adding a project
 
 The queue only knows about the engines that ask it. One harness that launches
@@ -587,6 +625,8 @@ semaphore of size one would deadlock both on the first call.
 | mfrs `run_attach.sh` | – | – | – | no engine, never queued |
 | prognosticator `capture-warehouse.mjs` | 1 | 1 | 1 | windowed; releases when the engine exits, not when ffmpeg does |
 | prognosticator `godot-export-web.js` | 1 | – | 1 | two headless passes, one after the other |
+| oathkeep `run_test.sh <one selector>` | 1 | – | 1 | |
+| oathkeep `run_test.sh all` (or several selectors) | 1–4, flexible | – | = granted width | `SHARDS`, default 4; whole suites dealt out by last-run seconds |
 
 Queue order is **shortest first**, estimated from the `weights-<tree>.json` a
 suite writes, so a twenty-second tagged slice does not sit behind two
@@ -616,6 +656,14 @@ The client reads the width back (`$TESTQ_SLOTS` in bash, `slot.slots` in
 Node) and launches exactly that many engines — `run_test_par.sh` picks its
 shard count off the grant. A job whose engine count is fixed must never send
 `slots_min`.
+
+A flexible job's history estimate is its **work**, not its wall time: the
+median of seconds × slots granted over its recent runs, divided by the width
+it asks for now. So a project that moves a suite from one engine to four is
+estimated from its old runs at a quarter of their length, rather than four
+times too long until the old runs age out, and `try_shrink` weighs the right
+amount of work. A rigid job always gets its width, so for it this is the plain
+median.
 
 ## Design notes worth knowing
 
@@ -807,7 +855,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-A hundred and forty-three tests, standard library only, a few seconds. They start no
+A hundred and forty-five tests, standard library only, a few seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over

@@ -1250,12 +1250,24 @@ class StartIn(Box):
 
 
 class Estimates(Box):
-    def ran(self, script, arg, seconds, size=None, tree="t"):
+    def ran(self, script, arg, seconds, size=None, tree="t", slots=1):
         self.q.append_history({
             "id": "J0", "tree": tree, "script": script, "arg": arg, "size": size,
             "exit": 0, "verdict": "released", "dur_s": seconds, "queued_s": 0,
-            "finished": self.clock})
+            "finished": self.clock, "slots": slots})
         self.clock += 1
+
+    def test_a_job_that_went_wide_is_estimated_by_its_work(self):
+        # Oathkeep's `all`: three runs on one engine, then two on four.
+        for seconds, slots in ((2400, 1), (2400, 1), (2400, 1), (650, 4), (610, 4)):
+            self.ran("run_test.sh", "all", seconds, slots=slots)
+        self.assertEqual(self.eta("run_test.sh", "all", slots=4, slots_min=1), 600)
+        self.assertEqual(self.eta("run_test.sh", "all", slots=2), 1200)
+
+    def test_a_rigid_job_is_still_the_plain_median(self):
+        for seconds in (100, 120, 900):
+            self.ran("run_mp.sh", "", seconds, slots=2)
+        self.assertEqual(self.eta("run_mp.sh", "", slots=2), 120)
 
     def eta(self, script, arg, **body):
         return self.q.estimate(script, arg, "t", body)
