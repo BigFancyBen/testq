@@ -24,7 +24,20 @@
  * for two hours. With `maxSeconds` this file ends the run itself: it gives the
  * slot back, kills everything it started, and exits 124.
  *
- * Environment: TESTQ=on|off|require, TESTQ_PORT, TESTQ_AUTOSTART=0|1, TESTQ_HOME.
+ * A run whose starter is gone gives up. While queued, and again while it holds
+ * a slot, this watches the process that started the harness (`process.ppid`).
+ * When that is gone the ticket is cancelled -- a running job by the same path as
+ * the page's button -- and the process exits 130: nobody is left to read the
+ * result, and it holds a place in line that someone else needs. A harness that
+ * was already orphaned when it began, or run with TESTQ_DETACHED=1, is left
+ * alone.
+ *
+ * A job identical to one this worktree already has queued (same script and
+ * arg) is not queued twice: acquire() warns, naming the ticket that holds the
+ * place, and exits 6.
+ *
+ * Environment: TESTQ=on|off|require, TESTQ_PORT, TESTQ_AUTOSTART=0|1, TESTQ_HOME,
+ * TESTQ_DETACHED=1.
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -44,6 +57,9 @@ const UNQUEUED = { queued: false, boxEngines: 0, slots: 0, release() {} };
 // How many times a job asks again after the daemon loses it before it stops
 // asking and runs. See the wait loop in acquire.
 const REQUEUE_LIMIT = 3;
+// How often a harness that holds a slot looks to see whether its starter is
+// still there.
+const STARTER_CHECK_MS = 5000;
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 const warn = (msg) => process.stderr.write(`!!! ${msg}\n`);
@@ -75,6 +91,48 @@ function killOwnTree(code) {
     );
   }
   process.exit(code);
+}
+
+/**
+ * Whether the process that started this harness is gone. Windows does not
+ * re-parent an orphan, so `process.ppid` keeps naming the dead one and signal 0
+ * asks the only question there is: does that pid still exist (EPERM says it
+ * does). A parent that was not there to begin with was a deliberate detach, and
+ * so is TESTQ_DETACHED=1: neither is ever reported gone.
+ */
+const STARTER = process.env.TESTQ_DETACHED === '1' ? 0 : process.ppid;
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+};
+const startedAlive = STARTER > 1 && alive(STARTER);
+export const starterGone = () => startedAlive && !alive(STARTER);
+
+/**
+ * While the job holds a slot: cancel it through the daemon if its starter goes
+ * away, then end this process whether or not the daemon answered.
+ */
+function watchStarter(slot, ticket, job) {
+  if (!startedAlive) return slot;
+  const release = slot.release.bind(slot);
+  const timer = setInterval(async () => {
+    if (!starterGone()) return;
+    warn(`the process that started ${job.script} is gone — cancelling it and giving the slot back`);
+    slot.released = true;
+    await post('cancel', { job: ticket, why: 'orphan' }, 60000);
+    killOwnTree(130);
+  }, STARTER_CHECK_MS);
+  timer.unref();
+  return Object.assign(slot, {
+    async release(exitCode) {
+      clearInterval(timer);
+      return release(exitCode);
+    },
+  });
 }
 
 /**
@@ -204,7 +262,7 @@ async function startDaemon() {
  *   answers sooner. Read the width back from `slot.slots` and launch that
  *   many engines. It is 0 when nobody said (unqueued): use what you asked for.
  * @param {number} [job.gpu]     1 if it opens a window
- *   (two fit at once); the `capacity.gpu` in /state, or anything above it, for
+ *   (three fit at once); the `capacity.gpu` in /state, or anything above it, for
  *   the card to itself — a frame time you mean to quote
  * @param {number} [job.engines] engines alive at once
  * @param {boolean} [job.exclusive] wants a quiet box (timing measurements)
@@ -252,6 +310,7 @@ export async function acquire(job, requeues = 0) {
       size: job.size ?? null,
       max_s: job.maxSeconds ?? null,
       idle_ok: Boolean(job.idleOk),
+      dedupe: 1,
       winpid: process.pid,
     },
     10000,
@@ -261,6 +320,18 @@ export async function acquire(job, requeues = 0) {
     warn('the testq daemon is older than this client — running UNQUEUED.');
     warn(`    Upgrade it with: ${request.body.hint || 'testq start --restart'}`);
     return withDeadline({ ...UNQUEUED }, job);
+  }
+  if (request.body?.duplicate) {
+    // Asked for a job this worktree already has queued. Not queued twice: two
+    // copies of one job is what a caller that lost track of its first does,
+    // and the second only makes the first wait longer.
+    const held = request.body.existing;
+    warn(
+      `this exact job (${job.script} ${job.arg || ''}) is already queued from this worktree ` +
+        `as ${held}, position ${request.body.position || '?'} — not queueing a second.`,
+    );
+    warn(`    Wait for that one, or replace it: python testq.py cancel ${held}`);
+    process.exit(6);
   }
   const ticket = request.body?.ticket;
   if (!ticket) {
@@ -278,7 +349,7 @@ export async function acquire(job, requeues = 0) {
   // infrastructure that silently drops assertions is worse than the flake.
   // The deadline is armed here, at the grant: time spent queued is free.
   const lease = (body) =>
-    withDeadline(
+    watchStarter(withDeadline(
       {
         queued: true,
         released: false,
@@ -291,7 +362,7 @@ export async function acquire(job, requeues = 0) {
         },
       },
       job,
-    );
+    ), ticket, job);
 
   if (request.body.granted) return lease(request.body);
 
@@ -334,6 +405,13 @@ export async function acquire(job, requeues = 0) {
   const startedWaiting = Date.now();
   let misses = 0;
   for (;;) {
+    if (starterGone()) {
+      // Whatever started this is gone, so nobody will read the result and the
+      // place in line is someone else's to have.
+      await post('cancel', { job: ticket, why: 'orphan' }, 10000);
+      warn('the process that started this is gone — left the testq queue');
+      process.exit(130);
+    }
     const poll = await post('wait', { ticket }, 40000);
     if (poll.status !== 200) {
       misses += 1;
