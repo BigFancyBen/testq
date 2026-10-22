@@ -38,7 +38,7 @@
 #               narrow answers sooner. Only for a job whose engine count
 #               follows the width it is granted: read $TESTQ_SLOTS back and
 #               launch that many.
-#   --gpu       1 if it opens a window (two fit at once); "$(testq_box_gpus)"
+#   --gpu       1 if it opens a window (three fit at once); "$(testq_box_gpus)"
 #               for the card to itself -- a frame time you mean to quote.
 #   --engines   engines alive at once, which is not always the slots booked:
 #               the daemon needs it to tell its own engines from strangers'.
@@ -83,6 +83,21 @@
 #   TESTQ_TREE             the checkout this runs in (default: $PROJ if the
 #                          sourcing script set one, else the directory of the
 #                          script that was run)
+#   TESTQ_DETACHED=1       this run is meant to outlive whatever started it
+#                          (nohup, setsid, a scheduled task). See below.
+#
+# A run whose starter is gone gives up. While queued, and again while it holds
+# slots, the client watches the process that started the script -- the shell or
+# agent whose child it is. When that is gone the ticket is cancelled (or the
+# running job is, by the same path as the page's button) and the script exits 4:
+# nobody is left to read the result, and it holds a place in line that someone
+# else needs. `&` and an agent's background run keep their starter, so they are
+# unaffected; so is a script that was already orphaned when it began.
+# TESTQ_DETACHED=1 turns the watch off.
+#
+# A job identical to one this worktree already has queued (same script and
+# argument) is not queued twice: the second caller is told which ticket holds
+# the place and exits 6. Run `testq cancel TICKET` first to replace it.
 #
 # Needs curl, sed and md5sum, which Git-Bash has.
 
@@ -207,17 +222,85 @@ testq_box_slots() {
 }
 
 # The same question about the GPU: how many windows fit on the card at once.
-# A run whose frame times are the point books this many. 2 when nobody answers.
+# A run whose frame times are the point books this many. 3 when nobody answers.
 testq_box_gpus() {
   local n=""
   [ "$TESTQ" != "off" ] && n="$(curl -fsS --max-time 2 "$TESTQ_URL/state" 2>/dev/null \
     | sed -n 's/.*"capacity"[: ]*{[^}]*"gpu"[: ]*\([0-9]*\).*/\1/p')"
-  [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || n=2
+  [ -n "$n" ] && [ "$n" -gt 0 ] 2>/dev/null || n=3
   printf '%s' "$n"
+}
+
+# -- who started this ------------------------------------------------------
+#
+# The process to watch is the PARENT of the shell running the script -- the
+# agent's shell or the terminal that said `bash run_test.sh` -- and not the
+# script's own shell, which is alive by definition. Stopping a backgrounded
+# `bash run_test.sh` used to kill the wrapper and leave the script, with its
+# client still polling /wait, re-parented to 1 and holding its place in line
+# for a run nobody would read. Twice in one day.
+#
+# Only a parent that is alive when the script begins is watched: a script
+# started already orphaned (nohup from a shell that has exited, setsid) was
+# detached on purpose, and so is one run with TESTQ_DETACHED=1.
+_TESTQ_PPID=""
+_TESTQ_PARENT_SET=""
+_TESTQ_WATCH=""
+
+_testq_parent_init() {
+  [ -n "$_TESTQ_PARENT_SET" ] && return 0
+  _TESTQ_PARENT_SET=1
+  [ "${TESTQ_DETACHED:-0}" = "1" ] && return 0
+  case "$PPID" in ""|0|1) return 0 ;; esac
+  kill -0 "$PPID" 2>/dev/null || return 0
+  _TESTQ_PPID="$PPID"
+}
+
+# Whether the starter is gone. MSYS re-parents an orphan to 1, so a parent pid
+# that has changed is the answer; failing that, a pid that no longer exists.
+_testq_orphaned() {
+  [ -n "$_TESTQ_PPID" ] || return 1
+  local now
+  now="$(cat "/proc/$$/ppid" 2>/dev/null)"
+  if [ -n "$now" ] && [ "$now" != "$_TESTQ_PPID" ]; then return 0; fi
+  kill -0 "$_TESTQ_PPID" 2>/dev/null || return 0
+  return 1
+}
+
+# While the job runs, the script is blocked in the engine and cannot look, so
+# a subshell does. It cancels the lease through the daemon -- the page's own
+# button, which kills the job's processes and records the run as `orphaned` --
+# and ends the script itself if the daemon cannot be reached. It goes when the
+# script does, and testq_release stops it. Its output is nowhere: the reader
+# is the thing that is gone, and a background process holding a pipe open
+# would keep an `$(...)` waiting for it.
+_testq_watch_starter() { # _testq_watch_starter <lease>
+  [ -n "$_TESTQ_PPID" ] || return 0
+  local lease="$1" me="$$"
+  (
+    while kill -0 "$me" 2>/dev/null; do
+      sleep 5
+      if _testq_orphaned; then
+        _testq_post cancel "{\"job\":\"$lease\",\"why\":\"orphan\"}" 70 >/dev/null
+        sleep 3
+        # The script's children first (the engine it is blocked on), then the
+        # script: killing only the script leaves its Godot running. MSYS has
+        # no reliable process-group kill, so walk /proc for its direct children.
+        local d
+        for d in /proc/[0-9]*; do
+          [ "$(cat "$d/ppid" 2>/dev/null)" = "$me" ] && kill "${d#/proc/}" 2>/dev/null
+        done
+        kill "$me" 2>/dev/null
+        break
+      fi
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  _TESTQ_WATCH=$!
 }
 
 _testq_granted() {
   _TESTQ_LEASE="$2"
+  _testq_watch_starter "$2"
   export TESTQ_BOX_ENGINES="$(_testq_num "$1" box_engines)"
   : "${TESTQ_BOX_ENGINES:=0}"
   # Matches `"slots":` and cannot match `"slots_min":` -- the closing quote is
@@ -253,6 +336,7 @@ testq_acquire() {
   [ -n "$script" ] || script="$(basename "$0")"
 
   [ "$TESTQ" = "off" ] && return 0
+  _testq_parent_init
 
   if ! _testq_up; then
     local py
@@ -280,7 +364,7 @@ testq_acquire() {
   body="$body,\"script\":\"$(_testq_json "$script")\",\"arg\":\"$(_testq_json "$arg")\""
   body="$body,\"slots\":$cpu,\"slots_min\":$min_cpu,\"gpu\":$gpu,\"engines\":$engines"
   body="$body,\"exclusive\":$exclusive,\"mutexes\":[$mutexes],\"size\":$size"
-  body="$body,\"max_s\":$max_s,\"stall_s\":$stall_s,\"idle_ok\":$idle_ok"
+  body="$body,\"max_s\":$max_s,\"stall_s\":$stall_s,\"idle_ok\":$idle_ok,\"dedupe\":1"
   body="$body,\"client\":$TESTQ_CLIENT,\"winpid\":$(_testq_winpid)}"
   resp="$(_testq_post acquire "$body" 10)"
   if [ -z "$resp" ]; then
@@ -293,6 +377,16 @@ testq_acquire() {
       echo "    Upgrade it with: $(_testq_str "$resp" hint)" >&2
       return 0 ;;
   esac
+  if _testq_is "$resp" duplicate; then
+    # Asked for a job this worktree already has queued. Not queued twice: two
+    # copies of one job is what an agent that lost track of its first
+    # command does, and the second only makes the first wait longer.
+    local held; held="$(_testq_str "$resp" existing)"
+    echo "!!! this exact job ($script $arg) is already queued from this worktree as $held, position $(_testq_num "$resp" position) -- not queueing a second." >&2
+    echo "    If $held is not yours to wait on (another agent's, or a dead one's): python testq.py cancel $held   and run this again." >&2
+    echo "=== RESULT: FAIL (exit 6) -- duplicate of $held queued from this tree ==="
+    exit 6
+  fi
   ticket="$(_testq_str "$resp" ticket)"
   [ -n "$ticket" ] || { echo "!!! testq gave no ticket -- running UNQUEUED" >&2; return 0; }
 
@@ -333,6 +427,14 @@ testq_acquire() {
   # rather than a poll storm; each miss prints one line so a background log
   # always says why nothing is happening yet.
   while :; do
+    if _testq_orphaned; then
+      # Whatever started this is gone, so nobody will read the result and the
+      # place in line is someone else's to have. Every poll, which is at least
+      # every 25 s.
+      _testq_post cancel "{\"job\":\"$ticket\",\"why\":\"orphan\"}" 10 >/dev/null
+      echo "!!! the process that started this is gone -- left the testq queue" >&2
+      exit 4
+    fi
     resp="$(_testq_post wait "{\"ticket\":\"$ticket\"}" 40)"
     if [ -z "$resp" ]; then
       misses=$((misses + 1))
@@ -373,8 +475,12 @@ testq_acquire() {
 # the status of THAT command and not the script's:
 #     trap 'rc=$?; rm -rf "$SCRATCH"; testq_release $rc' EXIT
 testq_release() {
-  [ -n "$_TESTQ_LEASE" ] || return 0
   local code="${1:-$?}"
+  if [ -n "$_TESTQ_WATCH" ]; then
+    kill "$_TESTQ_WATCH" 2>/dev/null
+    _TESTQ_WATCH=""
+  fi
+  [ -n "$_TESTQ_LEASE" ] || return 0
   _testq_post release "{\"lease\":\"$_TESTQ_LEASE\",\"exit_code\":${code:-0}}" 5 >/dev/null
   _TESTQ_LEASE=""
 }

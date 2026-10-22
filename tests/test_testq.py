@@ -1444,6 +1444,332 @@ class Capacity(unittest.TestCase):
         self.assertEqual(testq.CAPACITY["cpu"], 8)
 
 
+class GpuNotIdle(Box):
+    """A free window is not left idle behind CPU-only work. The box was at
+    8/8 CPU slots with the GPU under 10% busy: windowed jobs queue behind
+    shortest-first CPU work, and each freed slot went to the CPU job."""
+
+    GPUS = 3
+
+    def fill(self, cpu, gpu=0, eta=1000):
+        leases = []
+        for i in range(cpu):
+            leases.append(self.job(script="cpu%d.sh" % i, winpid=1000 + i, gpu=0,
+                                   slots=1, eta_s=eta))
+        for i in range(gpu):
+            leases.append(self.job(script="win%d.sh" % i, winpid=2000 + i, gpu=1,
+                                   slots=1, eta_s=eta))
+        for lease in leases:
+            self.assertTrue(self.running(lease))
+        return leases
+
+    def test_the_default_card_takes_three_windows(self):
+        self.assertEqual(testq.CAPACITY["gpu"], 3)
+
+    def test_a_freed_slot_goes_to_the_windowed_job_not_the_shorter_cpu_one(self):
+        leases = self.fill(8)
+        short = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        shot = self.job(script="run_shots.sh", winpid=501, gpu=1, slots=1, eta_s=100)
+        self.assertEqual([t["id"] for t in self.q.order()], [short["id"], shot["id"]])
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(shot))
+        self.assertFalse(self.running(short))
+        self.assertEqual(short["blocked_on"],
+                         "waiting for a slot kept for a windowed job, so the GPU is not idle")
+        # And the CPU job has the next one.
+        self.q.release(leases[1]["id"], 0)
+        self.assertTrue(self.running(short))
+
+    def test_with_no_window_free_the_cpu_job_goes_first(self):
+        leases = self.fill(5, gpu=3)
+        short = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        shot = self.job(script="run_shots.sh", winpid=501, gpu=1, slots=1, eta_s=100)
+        self.q.release(leases[0]["id"], 0)                 # a CPU slot, no window
+        self.assertTrue(self.running(short))
+        self.assertFalse(self.running(shot))
+
+    def test_a_head_that_is_reserving_keeps_what_frees(self):
+        leases = self.fill(8)
+        wide = self.job(script="run_test_par.sh", winpid=500, gpu=0, slots=6, eta_s=5)
+        short = self.job(script="quick.sh", winpid=501, gpu=0, slots=1, eta_s=10)
+        shot = self.job(script="run_shots.sh", winpid=502, gpu=1, slots=1, eta_s=100)
+        self.q.release(leases[0]["id"], 0)
+        for ticket in (wide, short, shot):
+            self.assertFalse(self.running(ticket))
+        for lease in leases[1:6]:
+            self.q.release(lease["id"], 0)
+        self.assertTrue(self.running(wide))
+        self.assertFalse(self.running(shot))
+        self.q.release(leases[6]["id"], 0)
+        self.assertTrue(self.running(shot))
+
+    def test_a_job_that_has_aged_is_never_held(self):
+        leases = self.fill(8, eta=5000)
+        old = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        self.run_for(700)
+        shot = self.job(script="run_shots.sh", winpid=501, gpu=1, slots=1, eta_s=100)
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(old))
+        self.assertFalse(self.running(shot))
+
+    def test_when_both_fit_nobody_is_held(self):
+        leases = self.fill(8)
+        pair = self.job(script="pair.sh", winpid=500, gpu=0, slots=2, eta_s=10)
+        shot = self.job(script="run_shots.sh", winpid=501, gpu=1, slots=1, eta_s=100)
+        for lease in leases[:3]:
+            self.dead.add(lease["winpid"])
+        self.run_for(5)
+        self.assertTrue(self.running(pair) and self.running(shot))
+
+    def test_a_windowed_job_stuck_on_a_mutex_holds_nothing(self):
+        leases = self.fill(7)
+        clip = self.job(script="clip.sh", winpid=400, gpu=1, slots=1, eta_s=50,
+                        mutexes=["clip:a"])
+        self.assertTrue(self.running(clip))                # holds the mutex
+        short = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        twin = self.job(script="clip2.sh", winpid=501, gpu=1, slots=1, eta_s=100,
+                        mutexes=["clip:a"])
+        self.assertFalse(self.running(short) or self.running(twin))
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(short))               # twin cannot start anyway
+        self.assertFalse(self.running(twin))
+
+    def test_a_measurement_waiting_for_the_card_does_not_hold_the_line(self):
+        # A window is in use, so run_perf's ask for all three waits and
+        # reserves the GPU; the shot behind it cannot start either. Holding
+        # the CPU job for that shot would idle the slot until aging.
+        leases = self.fill(7, gpu=1)
+        short = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        perf = self.job(script="run_perf.sh", winpid=501, gpu=3, slots=1, eta_s=20)
+        shot = self.job(script="run_shots.sh", winpid=502, gpu=1, slots=1, eta_s=100)
+        self.assertEqual([t["id"] for t in self.q.order()],
+                         [short["id"], perf["id"], shot["id"]])
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(short))
+        self.assertFalse(self.running(shot))
+
+
+class Duplicates(Box):
+    """One job, asked for twice by one worktree."""
+
+    def queue_two(self, **more):
+        self.job(script="hog.sh", arg="y", winpid=100, tree=WT_A)             # holds the card
+        first = self.job(script="run_shots.sh", arg="sdt_hf", winpid=200, tree=WT_A, **more)
+        second = self.job(script="run_shots.sh", arg="sdt_hf", winpid=201, tree=WT_A, **more)
+        return first, second
+
+    def test_the_second_is_refused_and_names_the_first(self):
+        first, second = self.queue_two(dedupe=True)
+        self.assertTrue(second.get("duplicate"))
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(len(self.q.queue), 1)
+        reply = testq.acquire_reply(self.q, second)
+        self.assertEqual(reply["duplicate"], 1)
+        self.assertEqual(reply["existing"], first["id"])
+        self.assertEqual(reply["position"], 1)
+        # No ticket to mistake for its own, and nothing that reads as a grant.
+        self.assertNotIn("ticket", reply)
+        self.assertNotIn("true", json.dumps(reply))
+
+    def test_a_client_that_did_not_say_it_can_be_told_gets_a_second_ticket(self):
+        first, second = self.queue_two()
+        self.assertFalse(second.get("duplicate"))
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(len(self.q.queue), 2)
+
+    def test_the_same_client_asking_again_gets_its_own_ticket_back(self):
+        self.job(script="hog.sh", winpid=100, tree=WT_A)
+        first = self.job(script="run_shots.sh", arg="a", winpid=200, tree=WT_A, dedupe=True)
+        again = self.job(script="run_shots.sh", arg="a", winpid=200, tree=WT_A, dedupe=True)
+        self.assertEqual(again["id"], first["id"])
+        self.assertFalse(again.get("duplicate"))
+        self.assertEqual(len(self.q.queue), 1)
+
+    def test_a_different_arg_or_worktree_is_a_different_job(self):
+        self.job(script="hog.sh", winpid=100, tree=WT_A)
+        a = self.job(script="run_shots.sh", arg="a", winpid=200, tree=WT_A, dedupe=True)
+        b = self.job(script="run_shots.sh", arg="b", winpid=201, tree=WT_A, dedupe=True)
+        c = self.job(script="run_shots.sh", arg="a", winpid=202, tree=WT_B, dedupe=True)
+        self.assertEqual(len({a["id"], b["id"], c["id"]}), 3)
+        self.assertEqual(len(self.q.queue), 3)
+
+    def test_a_copy_that_is_running_is_not_in_the_way(self):
+        running = self.job(script="run_shots.sh", arg="a", winpid=100, tree=WT_A, dedupe=True)
+        self.assertTrue(self.running(running))
+        again = self.job(script="run_shots.sh", arg="a", winpid=200, tree=WT_A, dedupe=True)
+        self.assertFalse(again.get("duplicate"))
+        self.assertEqual(len(self.q.queue), 1)
+
+    def test_a_copy_whose_client_died_is_not_in_the_way(self):
+        first, _ = self.queue_two()
+        self.q.cancel(self.q.queue[-1]["id"])
+        self.dead.add(first["winpid"])
+        retry = self.job(script="run_shots.sh", arg="sdt_hf", winpid=202, tree=WT_A,
+                         dedupe=True)
+        self.assertFalse(retry.get("duplicate"))
+        self.assertEqual(len(self.q.queue), 1)
+
+
+class Orphans(Box):
+    def test_a_queued_job_cancelled_by_its_own_client_is_orphaned(self):
+        self.job(winpid=100)
+        waiting = self.job(script="b.mjs", winpid=200)
+        self.assertEqual(self.q.cancel(waiting["id"], "orphan"), "removed a queued job")
+        self.assertEqual(self.verdict(waiting), "orphaned")
+        self.assertEqual(self.q.queue, [])
+
+    def test_a_running_job_cancelled_by_its_own_client_is_orphaned(self):
+        first = self.job(tree=WT_A, winpid=40)
+        self.engine(41, 40, WT_A)
+        second = self.job(script="b.mjs", winpid=200)
+        self.assertEqual(self.q.cancel(first["id"], "orphan"), "cancelled a running job")
+        self.assertEqual(sorted(self.killed), [40, 41])
+        self.assertEqual(self.verdict(first), "orphaned")
+        self.assertTrue(self.running(second))
+
+    def test_the_page_and_the_terminal_are_still_just_cancelled(self):
+        running = self.job(winpid=100)
+        self.assertEqual(self.q.cancel(running["id"]), "cancelled a running job")
+        self.assertEqual(self.verdict(running), "cancelled")
+
+    def test_it_is_not_an_alert(self):
+        self.assertEqual(testq.alert_for(None, "orphaned"), "")
+
+
+class CancelCommand(unittest.TestCase):
+    STATE = {"queued": [
+        {"id": "J5", "tree_id": "hats-a1b2c3", "tree_path": WT_B},
+        {"id": "J6", "tree_id": "weekend-features-d4e5f6", "tree_path": WT_A},
+        {"id": "J7", "tree_id": "hats-a1b2c3", "tree_path": WT_B},
+    ], "running": [{"id": "J1", "tree_id": "hats-a1b2c3", "tree_path": WT_B}]}
+
+    def run_cancel(self, jobs=(), tree="", known=("J5", "J6", "J7", "J1")):
+        sent = []
+
+        def fake(port, path, payload=None, timeout=5.0):
+            if path == "/state":
+                return 200, self.STATE
+            sent.append(payload["job"])
+            if payload["job"] in known:
+                return 200, {"cancelled": "removed a queued job"}
+            return 404, {"error": "no such job"}
+
+        out = io.StringIO()
+        args = mock.Mock(port=43999, jobs=list(jobs), tree=tree)
+        with mock.patch.object(testq, "http_json", fake), \
+                mock.patch("sys.stdout", out):
+            code = testq.cmd_cancel(args)
+        return code, sent, out.getvalue()
+
+    def test_by_id(self):
+        code, sent, out = self.run_cancel(["J6"])
+        self.assertEqual((code, sent), (0, ["J6"]))
+        self.assertIn("J6: removed a queued job", out)
+
+    def test_a_worktrees_queued_jobs_and_not_the_running_one(self):
+        code, sent, _ = self.run_cancel(tree="hats")
+        self.assertEqual((code, sent), (0, ["J5", "J7"]))
+
+    def test_a_fragment_of_a_name_cancels_nothing(self):
+        code, sent, out = self.run_cancel(tree="weekend")
+        self.assertEqual(sent, [])
+        self.assertIn("no queued jobs", out)
+
+    def test_the_whole_id_works_and_what_it_cancels_is_shown(self):
+        _, sent, out = self.run_cancel(tree="weekend-features-d4e5f6")
+        self.assertEqual(sent, ["J6"])
+        self.assertIn("will cancel J6", out)
+
+    def test_a_name_shared_by_two_checkouts_is_refused(self):
+        state = {"queued": self.STATE["queued"] + [
+            {"id": "J8", "tree_id": "hats-ffffff", "tree_path": WT_A}], "running": []}
+        with mock.patch.object(
+                type(self), "STATE", state):
+            code, sent, out = self.run_cancel(tree="hats")
+        self.assertEqual((code, sent), (2, []))
+        self.assertIn("hats-ffffff", out)
+
+    def test_an_id_that_is_gone_says_so_and_fails(self):
+        code, sent, out = self.run_cancel(["J99"])
+        self.assertEqual(code, 1)
+        self.assertIn("no such job", out)
+
+    def test_nothing_to_cancel(self):
+        self.assertEqual(self.run_cancel()[0], 2)
+        code, sent, out = self.run_cancel(tree="nope")
+        self.assertEqual((code, sent), (0, []))
+        self.assertIn("no queued jobs", out)
+
+    def test_it_is_in_the_help(self):
+        shown = io.StringIO()
+        with mock.patch("sys.stdout", shown), self.assertRaises(SystemExit):
+            testq.main(["cancel", "--help"])
+        self.assertIn("--tree", shown.getvalue())
+        shown = io.StringIO()
+        with mock.patch("sys.stdout", shown), self.assertRaises(SystemExit):
+            testq.main(["--help"])
+        self.assertIn("cancel", shown.getvalue())
+
+
+class StatsOutcomes(Box):
+    def row(self, script, arg, exit_code, verdict, ago):
+        ticket = self.job(script=script, arg=arg, winpid=100)
+        self.q.leases.pop(ticket["id"], None)
+        row = self.q.history_row(ticket, exit_code, verdict)
+        row["finished"] = self.clock - ago
+        self.q.append_history(row)
+
+    def stats(self, days=1.0, tree=""):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            testq.cmd_stats(mock.Mock(days=days, tree=tree, limit=12))
+        return out.getvalue()
+
+    def line(self, text, job):
+        return next(l for l in text.splitlines() if l.strip().startswith(job))
+
+    def test_when_a_long_job_last_passed_is_on_its_row(self):
+        self.row("run_test.sh", "all", 0, "released", 3 * 86400)    # outside the window
+        self.row("run_test.sh", "all", 1, "released", 3600)
+        self.row("run_test.sh", "all", 0, "released", 7200)
+        self.row("run_shots.sh", "x", 0, "released", 60)
+        text = self.stats()
+        self.assertIn("last green 2.0h ago", self.line(text, "run_test.sh all"))
+        self.assertIn("last green 60s ago", self.line(text, "run_shots.sh x"))
+
+    def test_a_job_that_has_never_passed_says_so(self):
+        self.row("run_mp.sh", "", 1, "released", 600)
+        self.row("run_mp.sh", "", None, "cancelled", 300)
+        self.assertIn("never green on record", self.line(self.stats(), "run_mp.sh"))
+
+    def test_the_window_does_not_hide_the_last_green(self):
+        self.row("run_test.sh", "all", 0, "released", 3 * 86400)
+        self.row("run_test.sh", "all", 1, "released", 600)
+        line = self.line(self.stats(days=1.0), "run_test.sh all")
+        self.assertIn("0 passed, 1 failed", line)
+        self.assertIn("last green 3d ago", line)
+
+    def test_the_tree_filter_applies(self):
+        self.row("run_test.sh", "all", 0, "released", 600)
+        self.assertIn("no runs recorded", self.stats(tree="no-such-tree"))
+
+    def test_cancelled_and_lost_are_told_apart(self):
+        for verdict in ("cancelled", "orphaned", "abandoned", "abandoned",
+                        "reclaimed", "stalled", "overran"):
+            self.row("run_test.sh", "all", None, verdict, 600)
+        text = self.stats()
+        line = self.line(text, "run_test.sh all")
+        self.assertIn("1 cancelled", line)
+        self.assertIn("1 orphaned", line)
+        self.assertIn("2 left the queue", line)
+        self.assertIn("1 lost mid-run", line)
+        self.assertIn("2 killed by the daemon", line)
+        self.assertNotIn("cancelled/lost", text)
+        # Each is explained once, under the table.
+        self.assertIn("lost mid-run: the client vanished while running", text)
+        self.assertIn("orphaned: cancelled by their own client", text)
+
+
 class RequestAllowed(unittest.TestCase):
     """Who may talk to the daemon: its clients and its own page, not a
     website that happens to be open in the browser on the same machine."""
