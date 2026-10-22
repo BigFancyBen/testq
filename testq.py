@@ -40,6 +40,7 @@ Subcommands:
   serve     run the HTTP server (internal -- `start` calls this)
   start     snapshot this file to the runtime dir and spawn `serve` detached
   status    one line per running and queued job
+  cancel    cancel jobs by id, or every queued job of a worktree (--tree)
   stop      ask the daemon to exit
   tray      pin the notification-area icon up (the daemon raises it by itself
             while the box is busy, so this is only for keeping it there)
@@ -88,16 +89,19 @@ DEFAULT_PORT = 43117
 #
 # These are the defaults, sized for that box. Another machine says its own in
 # config.json (see load_capacity).
-CAPACITY = {"cpu": 8, "gpu": 2}
+CAPACITY = {"cpu": 8, "gpu": 3}
 
-# One card, two windows on it at once. It was one, and that was the queue's
+# One card, three windows on it at once. It was one, and that was the queue's
 # worst line: in a week, GPU jobs ran for 17 hours and queued for 44, 34 of
-# them behind another window -- 14 behind their own worktree's. The card was
-# never the constraint. Three windowed engines leave an RTX 3080 at a quarter
-# busy; what they cost is memory, about 1.6 GB each of 12, on a desktop that
-# already holds several. So two, not three. A job whose numbers need the card
-# to itself books both (run_perf does); an ask for more than there is means
-# all of it.
+# them behind another window -- 14 behind their own worktree's. Then two. The
+# card was never the constraint: three windowed engines leave an RTX 3080 at a
+# quarter busy, and what a window costs is memory, about 1.6 GB of its 12 --
+# so three is 4.8 GB, which fits beside a desktop that already holds several.
+# On 2026-10-21 GPU utilisation sat under 10% while the CPU was at
+# 80%, with windowed jobs queued behind each other and behind the CPU slots.
+# A job whose numbers need the card to itself books all of it (run_perf does); an
+# ask for more than there is means all of it. A machine whose card is smaller
+# says so in config.json.
 
 TICK_SECONDS = 5.0
 TASKLIST_CACHE_SECONDS = 5.0
@@ -1714,16 +1718,52 @@ class Queue(object):
         """
         def key(ticket):
             eta = ticket.get("eta_s")
-            waited = now() - ticket["enqueued_at"]
-            limit = AGE_FLOOR_SECONDS
-            if eta is not None:
-                limit = max(limit, 2.0 * float(eta))
             eta = UNKNOWN_ETA if eta is None else float(eta)
-            aged = waited > limit
-            if aged:
+            if self.is_aged(ticket):
                 return (0, ticket["enqueued_at"], 0.0)
             return (1, eta, ticket["enqueued_at"])
         return sorted(self.queue, key=key)
+
+    def is_aged(self, ticket):
+        """Whether `ticket` has waited past max(600 s, twice its estimate),
+        which puts it at the front in arrival order. See order()."""
+        eta = ticket.get("eta_s")
+        limit = AGE_FLOOR_SECONDS
+        if eta is not None:
+            limit = max(limit, 2.0 * float(eta))
+        return now() - ticket["enqueued_at"] > limit
+
+    def gpu_hold(self, ticket, later, free_cpu, free_gpu, reserved_mutexes):
+        """Whether a free GPU window is waiting on the CPU slot that
+        `ticket`, a CPU-only job, is about to take. Holds the lock.
+
+        Shortest first puts a windowed job (a shot, a clip) behind every
+        short CPU-only job, and a CPU slot that frees is taken by whichever of
+        them sorts first. With eight slots taken and a window free that is a
+        window idle for as long as short CPU work keeps arriving: on
+        2026-10-21 the GPU sat under 10% busy for a day while jobs queued
+        1.6 h behind each other and 9.2 h for a CPU slot. So a CPU-only job
+        gives way to a windowed one behind it when the window is free, the
+        windowed job would fit but for this job's slots, and nothing else is in
+        the way. One that has aged is never held (that is what aging is for).
+        Nor is one that is accruing, a wide job that has been collecting
+        slots as they free (see grant_pass): its reservation already took
+        everything free ahead of this being asked, and the last slot it needs
+        is not for a window to take.
+        """
+        if self.is_aged(ticket) or ticket.get("accruing"):
+            return False
+        need_cpu = self.need_of(ticket)[0]
+        for other in later:
+            other_cpu, other_gpu = self.need_of(other)
+            if other_gpu <= 0 or other.get("exclusive") or other_gpu > free_gpu:
+                continue
+            if any(key in self.held_mutex or key in reserved_mutexes
+                   for key in other.get("mutexes", [])):
+                continue
+            if other_cpu <= free_cpu < other_cpu + need_cpu:
+                return True
+        return False
 
     def grant_pass(self):
         used_cpu = sum(self.need_of(l)[0] for l in self.leases.values())
@@ -1743,7 +1783,8 @@ class Queue(object):
         reserved_mutexes = set()
         reserved_cpu = 0
         reserved_gpu = 0
-        for ticket in self.order():
+        order = self.order()
+        for index, ticket in enumerate(order):
             need_cpu, need_gpu = self.need_of(ticket)
             mutexes = list(ticket.get("mutexes", []))
             blocked_mutex = any(
@@ -1771,6 +1812,17 @@ class Queue(object):
                 fits = (not blocked_mutex and not self.leases and quiet
                         and not reserved_cpu and not reserved_gpu)
                 outwaiting = not quiet
+            # A free window is not left idle behind CPU-only work: see
+            # gpu_hold. Held, it reserves nothing -- the slot is for the
+            # windowed job, which is behind it and takes it in its own turn.
+            if (fits and need_gpu == 0 and need_cpu > 0 and not ticket.get("exclusive")
+                    and self.gpu_hold(ticket, order[index + 1:], free_cpu,
+                                      free_gpu, reserved_mutexes)):
+                # Not charged to a reason of its own: it is an instant, one
+                # pass, and charge() would book the gap since the last look
+                # to it. The time stays with `slots`, which it was.
+                ticket["blocked_on"] = self.explain(ticket, "gpu_hold")
+                continue
             if not fits and self.try_shrink(ticket, blocked_mutex, free_cpu,
                                             free_gpu, reserved_gpu > 0):
                 need_cpu, need_gpu = self.need_of(ticket)
@@ -1819,6 +1871,8 @@ class Queue(object):
                 behind_gpu = (need_gpu > 0
                               and reserved_gpu + need_gpu > self.capacity["gpu"])
                 if ticket.get("exclusive") or not (gpu_alone or behind_gpu):
+                    if free_cpu > 0:
+                        ticket["accruing"] = True          # see gpu_hold
                     reserved_cpu += need_cpu
                     free_cpu = max(0, free_cpu - need_cpu)
                 reserved_gpu += need_gpu
@@ -1952,6 +2006,8 @@ class Queue(object):
             return "waiting for a quiet box"
         if reason == "gpu":
             return "waiting for the GPU"
+        if reason == "gpu_hold":
+            return "waiting for a slot kept for a windowed job, so the GPU is not idle"
         if reason == "outside":
             return "waiting for slots -- %d unmanaged engine(s) on the box" % self.stray
         if reason == "ahead":
@@ -2034,7 +2090,8 @@ class Queue(object):
             # Its shell is being killed from the page. Whichever notices
             # first -- the shell's own exit trap, the reaper, or cancel() --
             # it was cancelled.
-            exit_code, verdict = None, "cancelled"
+            exit_code = None
+            verdict = "orphaned" if lease.get("cancel_why") == "orphan" else "cancelled"
         self.stall_samples.pop(lease_id, None)
         for key in list(self.held_mutex):
             if self.held_mutex[key] == lease_id:
@@ -2050,6 +2107,19 @@ class Queue(object):
             script = str(body.get("script", "?"))
             arg = str(body.get("arg", ""))
             tree_id = str(body.get("tree_id", "?"))
+            # Clear the dead out first, so that a retry is not refused for a
+            # predecessor that is already gone, and so that it is parked in
+            # time to be picked up below.
+            self.reap()
+            twin = self.queued_twin(tree_id, script, arg)
+            if twin is not None:
+                winpid = int(body.get("winpid", 0) or 0)
+                if winpid and winpid == twin.get("winpid"):
+                    # The same client asking again, after a daemon that
+                    # seemed to have stopped answering: its own ticket.
+                    return twin
+                if body.get("dedupe"):
+                    return dict(twin, duplicate=True)
             eta = body.get("eta_s")
             if eta is None:
                 eta = self.estimate(script, arg, tree_id, body)
@@ -2099,11 +2169,6 @@ class Queue(object):
                 "observed_max_procs": 0,
                 "box_engines": 0,
             }
-            # A retry can be here before the tick that would notice its
-            # predecessor died -- an agent whose command timed out asks again
-            # within the second. Clear the dead out first so that it is parked
-            # in time to be picked up.
-            self.reap()
             parked = self.parked.pop(self.park_key(ticket), None)
             if parked and now() - parked[1] <= PARK_SECONDS:
                 # The same job from the same worktree, back after its client
@@ -2123,6 +2188,14 @@ class Queue(object):
             self.save_state()
             self.changed.notify_all()
             return ticket
+
+    def queued_twin(self, tree_id, script, arg):
+        """The ticket already queued for this very job from this worktree, or
+        None. Holds the lock. Queued only: a copy of it running is not in the
+        way of asking for another, which is how a suite is run again after an
+        edit."""
+        key = (tree_id, script, arg)
+        return next((t for t in self.queue if self.park_key(t) == key), None)
 
     def estimate(self, script, arg, tree_id, body):
         project = str(body.get("project", ""))
@@ -2297,7 +2370,11 @@ class Queue(object):
                 self.changed.notify_all()
             return ok
 
-    def cancel(self, job_id):
+    def cancel(self, job_id, why=""):
+        """Take a job out, queued or running. `why` is "orphan" when its own
+        client is doing it because the process that started it is gone, which
+        the history records as `orphaned` rather than `cancelled`: a run its
+        owner walked away from is not the same fact as one somebody stopped."""
         with self.lock:
             self.cancelled.add(job_id)
             lease = self.leases.get(job_id)
@@ -2306,12 +2383,14 @@ class Queue(object):
                 if ticket is None:
                     return None
                 self.queue.remove(ticket)
-                self.append_history(self.history_row(ticket, None, "cancelled"))
+                self.append_history(self.history_row(
+                    ticket, None, "orphaned" if why == "orphan" else "cancelled"))
                 # Its client is long-polling; tell it the ticket is gone so it
                 # stops waiting instead of sitting there for a minute.
                 self.changed.notify_all()
                 return "removed a queued job"
             lease["cancelling"] = True
+            lease["cancel_why"] = why
             winpid, tree_path = lease.get("winpid"), lease.get("tree_path", "")
             spare = self.other_shells(job_id)
         # Not under the lock, as rescue_stalled's is not: the kill is several
@@ -2430,6 +2509,28 @@ def acquire_reply(queue, ticket):
     # wait can then print one line about it now, instead of staying
     # silent until its first long poll happens to come back -- which,
     # if the wait is under 25 s, is never.
+    if ticket.get("duplicate"):
+        # Identical to a job this worktree already has queued, and the caller
+        # said it can be told so (`dedupe`). No `ticket` in this reply, on
+        # purpose: a client that did not look for `duplicate` would take it
+        # for its own and poll the other caller's, and both would run on one
+        # booking. Nothing here says `true` either: see not_granted_flag.
+        with queue.lock:
+            order = queue.order()
+            position = next((i + 1 for i, t in enumerate(order)
+                             if t["id"] == ticket["id"]), 0)
+            real = order[position - 1] if position else ticket
+            start_in, floor = queue.start_in(real, order)
+        return {
+            "duplicate": 1,
+            "granted": 0,
+            "existing": ticket["id"],
+            "position": position,
+            "blocked_on": ticket.get("blocked_on", ""),
+            "start_in_s": start_in,
+            "start_in_floor": not_granted_flag(floor),
+            "waiting_s": round(now() - ticket["enqueued_at"], 1),
+        }
     with queue.lock:
         granted = ticket["id"] in queue.leases
         position, blocked = 0, ""
@@ -2561,7 +2662,7 @@ class Handler(BaseHTTPRequestHandler):
             ok = self.queue.release(str(body.get("lease", "")), body.get("exit_code"))
             return self._send(200, {"released": ok})
         if path == "/cancel":
-            what = self.queue.cancel(str(body.get("job", "")))
+            what = self.queue.cancel(str(body.get("job", "")), str(body.get("why", "")))
             if what is None:
                 return self._send(404, {"error": "no such job"})
             return self._send(200, {"cancelled": what})
@@ -3347,10 +3448,11 @@ def cmd_status(args):
         if q.get("start_in_s") is not None:
             starts = "  starts in %s%s" % (">=" if q.get("start_in_floor") else "~",
                                            fmt_dur(q["start_in_s"]))
-        print("  WAIT %d %-34s %-16s waiting %-8s %s%s"
+        print("  WAIT %d %-34s %-16s waiting %-8s %s %s%s"
               % (q["position"], q["tree_id"][:34],
                  (q["script"] + " " + (q["arg"] or "")).strip(),
-                 fmt_dur(q.get("waiting_s")), q.get("blocked_on", ""), starts))
+                 fmt_dur(q.get("waiting_s")), q["id"], q.get("blocked_on", ""),
+                 starts))
     for g in state["godot"].get("outside", []):
         print("  OUT   %-34s %d engine(s) not started by a running job%s"
               % (g["tree"][:34], g["engines"],
@@ -3408,6 +3510,38 @@ WAITED_ON = {
 }
 
 
+# The ways a run ends that are not a verdict from the job itself, in the order
+# `stats` lists them: (verdicts, the words in a job's row, what that means).
+# They were one "cancelled/lost" count, and eleven runs of one job read "0
+# passed, 6 failed, 5 cancelled/lost" without saying whether anybody had
+# stopped them, they had never started, or the box had lost them.
+LOST = {
+    "stopped": (("cancelled",), "cancelled",
+                "stopped from the page or `testq cancel`, queued or running"),
+    "orphaned": (("orphaned",), "orphaned",
+                 "cancelled by their own client because the process that "
+                 "started them had gone"),
+    "dropped": (("abandoned",), "left the queue",
+                "never started: the client stopped asking, or died, while queued"),
+    "lost": (("reclaimed",), "lost mid-run",
+             "the client vanished while running, killed or crashed -- the "
+             "daemon cannot tell which"),
+    "killed": (("stalled", "overran"), "killed by the daemon",
+               "hung or past its ceiling with something queued behind"),
+}
+
+
+def fmt_age(seconds):
+    seconds = max(0.0, seconds)
+    if seconds < 90:
+        return "%ds" % seconds
+    if seconds < 5400:
+        return "%dm" % round(seconds / 60.0)
+    if seconds < 172800:
+        return "%.1fh" % (seconds / 3600.0)
+    return "%dd" % round(seconds / 86400.0)
+
+
 def cmd_stats(args):
     """What the box has actually been doing, across every session.
 
@@ -3457,26 +3591,52 @@ def cmd_stats(args):
 
         print("\nby job:")
         print("  %-22s %5s %7s %7s %7s  %s"
-              % ("job", "runs", "median", "worst", "queued", "outcome"))
+              % ("job", "runs", "median", "worst", "queued",
+                 "outcome, and when it last passed"))
         rows = conn.execute(
             "SELECT script, arg, COUNT(*) n,"
             "       SUM(CASE WHEN verdict='released' AND exit=0 THEN 1 ELSE 0 END) ok,"
             "       SUM(CASE WHEN verdict='released' AND exit<>0 THEN 1 ELSE 0 END) bad,"
-            "       SUM(CASE WHEN verdict<>'released' THEN 1 ELSE 0 END) other,"
-            "       AVG(dur_s) avg, MAX(dur_s) worst, SUM(queued_s) queued"
+            + ",".join("SUM(CASE WHEN verdict IN (%s) THEN 1 ELSE 0 END) %s"
+                       % (", ".join("'%s'" % v for v in verdicts), key)
+                       for key, (verdicts, _, _) in LOST.items()) +
+            ",       AVG(dur_s) avg, MAX(dur_s) worst, SUM(queued_s) queued"
             " FROM runs WHERE " + where +
             " GROUP BY script, arg ORDER BY SUM(dur_s) DESC LIMIT ?",
             params + [args.limit]).fetchall()
+        # When each job last passed, over the whole history and not just the
+        # window above: the jobs worth asking about are the long ones, and a
+        # suite that takes eleven minutes and has been red all week reads
+        # "0 passed" here and says nothing about how long ago it was green.
+        # `run_test.sh all` was 11 runs, none of them passing, and nobody saw.
+        green = {}
+        green_where, green_params = "verdict='released' AND exit=0", []
+        if args.tree:
+            green_where += " AND tree LIKE ?"
+            green_params.append("%" + args.tree + "%")
+        for r in conn.execute(
+                "SELECT script, arg, MAX(finished) last FROM runs WHERE "
+                + green_where + " GROUP BY script, arg", green_params):
+            green[(r["script"], r["arg"])] = r["last"]
+        seen = []
         for r in rows:
             label = ("%s %s" % (r["script"], r["arg"] or "")).strip()
             outcome = "%d passed" % r["ok"]
             if r["bad"]:
                 outcome += ", %d failed" % r["bad"]
-            if r["other"]:
-                outcome += ", %d cancelled/lost" % r["other"]
+            for key, (_, words, _) in LOST.items():
+                if r[key]:
+                    outcome += ", %d %s" % (r[key], words)
+                    if key not in seen:
+                        seen.append(key)
+            last = green.get((r["script"], r["arg"]))
+            outcome += ("  [last green %s ago]" % fmt_age(now() - last)
+                        if last else "  [never green on record]")
             print("  %-22s %5d %7s %7s %7s  %s"
                   % (label[:22], r["n"], fmt_dur(r["avg"]), fmt_dur(r["worst"]),
                      fmt_dur(r["queued"]), outcome))
+        for key in seen:
+            print("    %s: %s" % (LOST[key][1], LOST[key][2]))
 
         print("\nby worktree:")
         rows = conn.execute(
@@ -3516,6 +3676,54 @@ def cmd_stats(args):
                       % (("%s %s" % (r["script"], r["arg"] or "")).strip()[:22],
                          (r["tree"] or "?")[:30], r["ok"], r["n"]))
     return 0
+
+
+def queued_for_tree(state, name):
+    """The queued tickets in a /state whose worktree matches `name`: a piece
+    of the tree id or of its path, any case. Queued only -- a run that has
+    started is stopped by its id, on purpose and one at a time."""
+    name = name.lower()
+    return [q for q in state.get("queued", [])
+            if name in (q.get("tree_id") or "").lower()
+            or name in (q.get("tree_path") or "").lower()]
+
+
+def cmd_cancel(args):
+    """Cancel jobs from the terminal, by the same path as the page's button.
+
+    A queued job is taken out of the line; a running one has its processes
+    killed and its slots handed on. The ids are the ones `status` prints.
+    `--tree` is for the case it was written for: an agent's session has gone
+    and left a worktree's jobs queued, none of which anyone will read.
+    """
+    port = port_from_env(args.port)
+    ids = list(args.jobs)
+    if args.tree:
+        code, state = http_json(port, "/state")
+        if code != 200 or not isinstance(state, dict):
+            print("testq is not running on port %d" % port)
+            return 1
+        found = queued_for_tree(state, args.tree)
+        if not found:
+            print("no queued jobs for a worktree matching %r" % args.tree)
+        ids += [q["id"] for q in found if q["id"] not in ids]
+    if not ids:
+        if not args.tree:
+            print("give a job id (see `status`) or --tree NAME")
+            return 2
+        return 0
+    failed = 0
+    for job in ids:
+        code, body = http_json(port, "/cancel", {"job": job}, timeout=60.0)
+        if code is None:
+            print("testq is not running on port %d" % port)
+            return 1
+        if code == 200:
+            print("%s: %s" % (job, body.get("cancelled", "cancelled")))
+        else:
+            failed += 1
+            print("%s: no such job (it may have finished)" % job)
+    return 1 if failed else 0
 
 
 def cmd_stop(args):
@@ -3679,6 +3887,13 @@ def main(argv):
     p = sub.add_parser("status", help="what the box is doing")
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("cancel", help="cancel jobs by id, or all of a worktree's queued ones")
+    p.add_argument("jobs", nargs="*", metavar="JOB", help="job ids, as `status` prints them")
+    p.add_argument("--tree", default="", metavar="NAME",
+                   help="every queued job of the worktree whose name contains this")
+    p.add_argument("--port", type=int, default=None)
+    p.set_defaults(fn=cmd_cancel)
 
     p = sub.add_parser("stop", help="stop the daemon")
     p.add_argument("--port", type=int, default=None)

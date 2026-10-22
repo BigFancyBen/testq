@@ -55,7 +55,7 @@ flowchart LR
   subgraph app["another project"]
     D["worktree: mk64<br/>capture.mjs"]
   end
-  A & B & C & D -- "acquire" --> Q{{"testq daemon<br/>8 slots · 2 GPU windows"}}
+  A & B & C & D -- "acquire" --> Q{{"testq daemon<br/>8 slots · 3 GPU windows"}}
   Q -- "granted: launch now" --> R["Godot engines<br/>on the box"]
   Q -. "queued: position, reason, start time" .-> W["waits before<br/>launching anything"]
   Q --- P["page · tray icon · testq.db history"]
@@ -68,7 +68,7 @@ flowchart LR
 - **Godot 4**, spotted by image name (`TESTQ_GODOT_MATCH`).
 - **Python 3, standard library only.** The Node client needs Node 18 or later.
 - **Built for one machine and published as it is.** The default capacity
-  (`CAPACITY` near the top of `testq.py`: eight slots, two windows on the GPU)
+  (`CAPACITY` near the top of `testq.py`: eight slots, three windows on the GPU)
   is sized for a 16-core box with one card. Say your own in `config.json`
   (below).
 
@@ -80,7 +80,7 @@ like, not as things to go and find.
 
 ## Why
 
-There is one box, one GPU that takes two windows at a time, and eight slots'
+There is one box, one GPU that takes three windows at a time, and eight slots'
 worth of admission — a slot being
 "a job's fair share of the machine", not a measured engine ceiling. (It was
 four, on mfrs's finding that six and eight shards ran 1.5–1.7× slower than
@@ -130,6 +130,7 @@ with `TESTQ_PY` set.
     python testq.py start --restart   # after editing testq.py; interrupts nothing
     python testq.py status
     python testq.py stats --days 7
+    python testq.py cancel JOB... | --tree NAME
     python testq.py stop [--force]
     python testq.py tray              # pin the icon up (it appears by itself)
     python testq.py reap              # delete scratch of deleted worktrees
@@ -370,6 +371,15 @@ per-job medians and worst cases, per-worktree totals, and — the useful one —
 pass and sometimes do not, which is the expensive kind of problem here and
 easy to miss one run at a time.
 
+The by-job rows end with **when the job last passed**, over the whole history
+rather than the window: `run_test.sh all` was 11 runs and none passed, and the
+row said only "6 failed, 5 cancelled/lost". The ends that are not the job's own
+verdict are now told apart -- `cancelled` (stopped from the page or `testq
+cancel`), `orphaned` (cancelled by its own client because its starter had gone),
+`left the queue` (never started), `lost mid-run` (the client vanished; the
+daemon cannot tell a kill from a crash) and `killed by the daemon` (stalled or
+overran) -- with a line under the table saying what each means.
+
 Each row's `waited_on` is its queued seconds by reason, as JSON: `gpu` behind
 another window, `slots` with every slot taken, `outside` for engines the queue
 did not start, `ahead` for a free slot being held for a job in front, `quiet`
@@ -440,7 +450,7 @@ Optional, in the runtime directory. It is how a machine that is not the one
 this was sized for says how big it is:
 
 ```json
-{ "capacity": { "cpu": 6, "gpu": 2 } }
+{ "capacity": { "cpu": 6, "gpu": 2 } }   // a smaller card says so
 ```
 
 `cpu` is the number of slots and `gpu` the number of windows the card takes at
@@ -513,6 +523,7 @@ installs nothing. It opens the same page either way.
 | `TESTQ_HOME` | — | runtime directory override |
 | `TESTQ_PY` | — | path to `testq.py`, if a Node client's autostart cannot find it |
 | `TESTQ_GODOT_MATCH` | `godot_v4` | image-name fragment used to spot engines |
+| `TESTQ_DETACHED` | — | `1`: this run may outlive whatever started it (see above) |
 
 Use `TESTQ=require` when a number has to be trustworthy — a performance
 measurement you intend to quote. Use `TESTQ=off` when the queue itself is what
@@ -545,6 +556,19 @@ reserved so a stream of small ones cannot keep it out. A job blocked only on
 the GPU reserves no slot — whoever holds the GPU hands a slot back with it —
 and neither does anything further back in the GPU line, so CPU-only work goes
 past all of it.
+
+**A free window is not left idle behind CPU-only work.** Shots and clips book
+one slot *and* one window. Shortest-first puts them behind every short
+CPU-only job, and each slot that frees goes to whichever of those sorts first:
+with the slots all taken, a window can sit empty for as long as short CPU work
+keeps arriving. So when a window is free and a windowed job behind would fit
+but for the slot a CPU-only job is about to take, that job is held for one pass
+and the slot falls to the windowed one (`gpu_hold`; the page says "waiting for
+a slot kept for a windowed job"). It is a hold, not a reservation, so it
+starves nobody: a job that has aged is never held, and neither is a wide job
+that is accruing slots under a reservation -- that reservation already took
+what was free, and the last slot it needs is not for a window to take. With no
+window free, or when both fit, nothing changes.
 
 ### Flexible width
 
@@ -619,11 +643,14 @@ that finished their scripts and never exited once docked every slot on the box
 and held their own session's queued jobs for sixteen minutes. The daemon does
 not kill them — they are not its to kill — it only stops waiting for them.
 
-**Two windows share the card, and a measurement books both.** GPU capacity was
-one, and it was the worst line on the box: over a week GPU jobs ran for 17
-hours and queued for 44, 34 of those behind another window. The card itself
-was a quarter busy with three windowed engines up; what a window costs is
-about 1.6 GB of its 12, which is why the number is two and not three. A shot
+**Three windows share the card, and a measurement books all of it.** GPU
+capacity was one, and it was the worst line on the box: over a week GPU jobs
+ran for 17 hours and queued for 44, 34 of those behind another window. It was
+raised to two, and on 2026-10-21 (24 h: 629 runs, 35.2 h of box time, 11.1 h
+queued -- 9.2 h for a CPU slot, 1.6 h behind another window) the card still
+read under 10% busy while the CPU sat near 80%. It was a quarter busy with
+three windowed engines up; what a window costs is about 1.6 GB of its 12, so
+three is 4.8 GB, which fits beside a desktop that already holds several. A shot
 or a fixed-fps clip does not care who else is drawing. A job that does —
 `run_perf.sh`, anything quoting a frame time — sends `gpu` equal to the
 capacity in `/state`, and an ask for more than there is is clamped to all of
@@ -720,11 +747,45 @@ is itself an engine.
 be started, the run goes ahead unqueued with a loud warning. Infrastructure
 that can stop you testing is worse than the contention it was built to prevent.
 
+### Clients that outlive their starter, and twice-asked jobs
+
+**A run whose starter is gone leaves the queue.** Stopping a backgrounded
+`bash run_test.sh` killed the wrapping shell and left the script's client
+polling with ppid 1, holding a place for output nobody would read; on
+2026-10-21 an app restart killed about eighteen agents and some twenty of their
+jobs stayed queued that way. Both clients now watch the process that started
+the script (the *parent* of the script's shell -- the script itself is alive by
+definition; `process.ppid` for the Node client). While queued they check on
+every poll (at most 25 s); while running, every few seconds. When it is gone
+they `POST /cancel` with `"why": "orphan"` -- a running job by the page's own
+path, so its processes are killed and its slots handed on -- and exit (bash 4,
+Node 130). The history records `orphaned`, not `cancelled`, so a run its owner
+walked away from is not counted with one somebody stopped. A parent that was
+already gone when the script began was a deliberate detach (`nohup`,
+`setsid`), and `TESTQ_DETACHED=1` says so explicitly; neither is watched.
+`&` and an agent's background run keep their starter and are unaffected.
+
+**`python testq.py cancel JOB... | --tree NAME`** is the same button from a
+terminal: ids are the ones `status` now prints, and `--tree` takes every
+*queued* job of the worktree whose id or path contains NAME. Running jobs are
+stopped by id only, one at a time, on purpose.
+
+**A job identical to one already queued from the same worktree is not queued
+twice.** Same `tree_id`, script and arg while the first is still *queued* (a
+copy that is running does not count: that is how a suite is run again after an
+edit). A client that sends `"dedupe": 1` is answered `{"duplicate": 1,
+"existing": ID, "position": N, ...}` with no `ticket`, and both clients print
+the id and exit 6; `testq cancel ID` replaces it. Refusal rather than handing
+back the existing ticket: two callers sharing one ticket would both think they
+held the booking and one slot would run two jobs. A client that does not send
+`dedupe` (older ones) is queued as before, and the same client process asking
+again after a lost reply gets its own ticket back.
+
 ## Testing the queue itself
 
     python -m unittest discover tests
 
-A hundred and twenty-seven tests, standard library only, a couple of seconds. They start no
+A hundred and sixty-two tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
