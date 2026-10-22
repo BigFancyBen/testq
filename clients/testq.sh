@@ -7,12 +7,20 @@
 # and the work goes ahead unqueued. Copy it in; if you change it, change it
 # here first.
 #
+# Client version 2 (2026-10-21): testq_progress and --stall. A project still
+# carrying version 1 queues exactly as before and has no progress on the page;
+# re-vendor to get it. The version is sent as `client` with every acquire.
+#
 # Usage, from a run script that launches Godot:
 #
 #     . "$(dirname "${BASH_SOURCE[0]}")/testq.sh"
 #     trap 'testq_release $?' EXIT
 #     testq_acquire --arg "$WHICH" --cpu 1 --engines 1
 #     timeout 1500 "$GODOT" --headless --path "$PROJ" -- --test="$WHICH"
+#
+# and, if the run can count its work, as often as is convenient while it runs:
+#
+#     testq_progress "$rows_done" "$rows_total" rows
 #
 # The one rule: acquire BEFORE any engine starts, including an import pass,
 # and release from an EXIT trap. Wrap each ENGINE in its own `timeout`, never
@@ -21,7 +29,8 @@
 #
 #     testq_acquire --arg X [--cpu N] [--min-cpu M] [--gpu N] [--engines N]
 #                   [--exclusive] [--mutex KEY]... [--size N] [--max SECONDS]
-#                   [--idle-ok] [--project NAME] [--script NAME]
+#                   [--idle-ok] [--stall SECONDS] [--project NAME]
+#                   [--script NAME]
 #
 #   --cpu       slots to book (default 1). More than the box means all of it.
 #   --min-cpu   a FLEXIBLE job: --cpu is what it wants, --min-cpu what it can
@@ -41,6 +50,9 @@
 #               past that, if anybody is waiting. (It is a backstop: your own
 #               `timeout` round the engine is what should fire first.)
 #   --idle-ok   a window that is meant to sit there; not to be taken for a hang.
+#   --stall     for a run that reports progress: how long its count may stand
+#               still before it is taken for hung (default 900). One step that
+#               can honestly take longer than that wants a bigger number.
 #   --project   key into the daemon's projects.json, for estimates and `reap`.
 #   --script    what to call this on the page (default: the script's own name).
 #
@@ -53,6 +65,14 @@
 #                       should assert only at 1, and must treat 0 -- nobody
 #                       knows -- as "assert anyway".
 #   testq_box_slots, testq_box_gpus   the size of the box, asked of the daemon.
+#   testq_progress DONE [TOTAL] [UNIT]  how far through its work the run is.
+#                       The page shows "2,310 / 3,104 rows" and drives its bar
+#                       off it, and from the first report the run is judged
+#                       hung by its count standing still rather than by its
+#                       cpu: a count that moves is never killed as stalled.
+#                       So once a run reports, keep reporting. Cheap: at most
+#                       one request in ten seconds, sent in the background,
+#                       never blocks and never fails the run.
 #
 # Environment:
 #   TESTQ=on|off|require   off bypasses the queue; require fails rather than
@@ -86,7 +106,9 @@ TESTQ_PORT="${TESTQ_PORT:-43117}"
 TESTQ_AUTOSTART="${TESTQ_AUTOSTART:-1}"
 TESTQ_URL="http://127.0.0.1:$TESTQ_PORT"
 TESTQ_PROTO=1
+TESTQ_CLIENT=2
 _TESTQ_LEASE=""
+_TESTQ_PROGRESS_AT=0
 export TESTQ_BOX_ENGINES="${TESTQ_BOX_ENGINES:-0}"
 
 # The path as GODOT writes it -- C:/Users/..., forward slashes -- because that
@@ -291,7 +313,7 @@ testq_acquire() {
   # forgotten the ticket, and the answer to that is the same request.
   local -a asked=("$@")
   local arg="" cpu=1 min_cpu=0 gpu=0 engines=1 exclusive=false mutexes=""
-  local size=null max_s=null idle_ok=false project="" script=""
+  local size=null max_s=null stall_s=null idle_ok=false project="" script=""
   export TESTQ_SLOTS=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -305,6 +327,7 @@ testq_acquire() {
       --size)      size="$2"; shift 2 ;;
       --max)       max_s="$2"; shift 2 ;;
       --idle-ok)   idle_ok=true; shift ;;
+      --stall)     stall_s="$2"; shift 2 ;;
       --project)   project="$2"; shift 2 ;;
       --script)    script="$2"; shift 2 ;;
       *)           shift ;;
@@ -341,7 +364,8 @@ testq_acquire() {
   body="$body,\"script\":\"$(_testq_json "$script")\",\"arg\":\"$(_testq_json "$arg")\""
   body="$body,\"slots\":$cpu,\"slots_min\":$min_cpu,\"gpu\":$gpu,\"engines\":$engines"
   body="$body,\"exclusive\":$exclusive,\"mutexes\":[$mutexes],\"size\":$size"
-  body="$body,\"max_s\":$max_s,\"idle_ok\":$idle_ok,\"dedupe\":1,\"winpid\":$(_testq_winpid)}"
+  body="$body,\"max_s\":$max_s,\"stall_s\":$stall_s,\"idle_ok\":$idle_ok,\"dedupe\":1"
+  body="$body,\"client\":$TESTQ_CLIENT,\"winpid\":$(_testq_winpid)}"
   resp="$(_testq_post acquire "$body" 10)"
   if [ -z "$resp" ]; then
     echo "!!! testq refused the job -- running UNQUEUED" >&2
@@ -459,4 +483,23 @@ testq_release() {
   [ -n "$_TESTQ_LEASE" ] || return 0
   _testq_post release "{\"lease\":\"$_TESTQ_LEASE\",\"exit_code\":${code:-0}}" 5 >/dev/null
   _TESTQ_LEASE=""
+}
+
+# testq_progress DONE [TOTAL] [UNIT] -- see the header. Rate-limited here so a
+# caller can report on every line it sees: one request in ten seconds, and the
+# last one (DONE = TOTAL) always. The clock is bash's own, so a report that is
+# skipped costs no process. A daemon too old to know /progress answers 404 and
+# nothing comes of it.
+testq_progress() {
+  [ -n "$_TESTQ_LEASE" ] || return 0
+  local count="${1:-0}" total="${2:-0}" unit="${3:-}" t
+  case "$count$total" in *[!0-9]*) return 0 ;; esac
+  printf -v t '%(%s)T' -1
+  if [ "$count" != "$total" ] && [ $((t - _TESTQ_PROGRESS_AT)) -lt 10 ]; then
+    return 0
+  fi
+  _TESTQ_PROGRESS_AT=$t
+  local body="{\"lease\":\"$_TESTQ_LEASE\",\"done\":$count,\"total\":$total"
+  body="$body,\"unit\":\"$(_testq_json "$unit")\"}"
+  ( _testq_post progress "$body" 3 >/dev/null 2>&1 & )
 }

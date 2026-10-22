@@ -8,6 +8,10 @@
  * turns into a warning and the work goes ahead unqueued. Copy it in; if you
  * change it, change it here first.
  *
+ * Client version 2 (2026-10-21): `slot.progress()` and `stallSeconds`. A
+ * project still carrying version 1 queues exactly as before and has no
+ * progress on the page; re-vendor to get it.
+ *
  * Usage:
  *
  *   import { acquire } from './lib/testq.mjs';
@@ -17,6 +21,11 @@
  *     maxSeconds: seconds + 240,  // past this, something has hung: stop
  *   });
  *   try { ...launch the engine... } finally { slot.release(process.exitCode ?? 0); }
+ *
+ * A job that can count its work says how far it has got, as often as is
+ * convenient -- `slot.progress(done, total, 'scenarios')` -- and the page shows
+ * the count, and the daemon judges it hung by the count standing still rather
+ * than by its cpu. Once a job reports, it should keep reporting.
  *
  * Give every job a `maxSeconds`. The bash harnesses wrap each engine in
  * `timeout`; nothing does that for a Node one, and an engine that finishes its
@@ -46,13 +55,17 @@ import { existsSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 const PROTO = 1;
+const CLIENT = 2;
+// The most often a progress report goes over the wire. A caller may report on
+// every unit of work; the rest are dropped here, except the last one.
+const PROGRESS_EVERY_MS = 10000;
 const PORT = Number(process.env.TESTQ_PORT || 43117);
 const BASE = `http://127.0.0.1:${PORT}`;
 const MODE = process.env.TESTQ || 'on';
 const AUTOSTART = process.env.TESTQ_AUTOSTART !== '0';
 
 /** A no-op slot, so callers never have to branch on whether queueing happened. */
-const UNQUEUED = { queued: false, boxEngines: 0, slots: 0, release() {} };
+const UNQUEUED = { queued: false, boxEngines: 0, slots: 0, release() {}, progress() {} };
 
 // How many times a job asks again after the daemon loses it before it stops
 // asking and runs. See the wait loop in acquire.
@@ -275,6 +288,8 @@ async function startDaemon() {
  *   Enforced here (see withDeadline) and, with a job waiting, by the daemon.
  * @param {boolean} [job.idleOk]    a window that is meant to sit there; the
  *   daemon will not take it for a hang. maxSeconds still applies.
+ * @param {number} [job.stallSeconds] for a job that reports progress: how
+ *   long its count may stand still before it is taken for hung (default 900).
  */
 export async function acquire(job, requeues = 0) {
   if (MODE === 'off') return withDeadline({ ...UNQUEUED }, job);
@@ -311,6 +326,8 @@ export async function acquire(job, requeues = 0) {
       max_s: job.maxSeconds ?? null,
       idle_ok: Boolean(job.idleOk),
       dedupe: 1,
+      stall_s: job.stallSeconds ?? null,
+      client: CLIENT,
       winpid: process.pid,
     },
     10000,
@@ -364,6 +381,19 @@ export async function acquire(job, requeues = 0) {
           if (this.released) return;
           this.released = true;
           await post('release', { lease: ticket, exit_code: exitCode ?? 0 }, 5000);
+        },
+        progressAt: 0,
+        /**
+         * How far through its work this job is: `done` of `total` (0 when
+         * nobody knows the total), counted in `unit`. Never waits and never
+         * throws; at most one request in PROGRESS_EVERY_MS goes out.
+         */
+        progress(done, total = 0, unit = '') {
+          if (this.released) return;
+          const at = Date.now();
+          if (done !== total && at - this.progressAt < PROGRESS_EVERY_MS) return;
+          this.progressAt = at;
+          post('progress', { lease: ticket, done, total, unit }, 3000);
         },
       },
       job,

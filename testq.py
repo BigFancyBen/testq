@@ -231,6 +231,37 @@ STALL_IDLE_CORES = 0.5
 CEILING_SECONDS = 3600.0
 CEILING_ETA_FACTOR = 4.0
 
+# A run that says how far through its work it is (POST /progress) is judged
+# by that and not by its cpu. Cpu cannot tell a slow run from a run spinning in
+# one test for an hour, and a busy box makes every honest run late; a count
+# that stops moving is the one thing a hung run cannot fake. So a run that has
+# reported progress is stalled when the count has not moved for this long, with
+# somebody waiting -- however busy it looks, and however early -- and a run
+# whose count is moving is never stalled, only stopped at its ceiling. Generous,
+# because one slow row must not convict a suite; a client that knows its rows
+# run longer says so with `stall_s`.
+PROGRESS_STALL_SECONDS = 900.0
+# A client may report as often as it likes; one reading in this long is kept
+# as the moment the count was last seen, which is all the page needs.
+PROGRESS_FRESH_SECONDS = 120.0
+
+# Every estimate is a run measured on some box, and the box is not always the
+# same one. On 21 October a suite with a 41-minute estimate was at 53 minutes
+# with five engines beside it, using a whole core, and nobody could tell from
+# the page that it was fine. In the history `run_test.sh all` takes a median
+# 504 s with one engine on the box and 673 s with five: about a tenth longer
+# for each engine past the first. So a running job's estimate is stretched by
+# how much busier the box is now than it was for the runs the estimate came
+# from, and the page says so. Only ever stretched: the old rows record the
+# most engines a run saw, not the average, and would make a quiet box look
+# quieter than it is.
+CONTENTION_PER_ENGINE = 0.1
+# Below this the stretch is noise and the page says nothing about it.
+CONTENTION_SHOWN = 1.15
+# How often a running job's own cpu is read for the page. It is the process
+# table refresh_observed already takes, so this costs a subtraction.
+CPU_SAMPLE_SECONDS = 10.0
+
 # A queued client that dies loses its ticket within a minute, and its retry
 # used to start again at the back -- which is how a session whose command timed
 # out after ten minutes in the queue came to wait twenty, or gave up and ran
@@ -482,7 +513,7 @@ class db(object):
             # Added after the table had three thousand rows in it. The other
             # copy of this file on the box names its columns when it inserts,
             # so it neither sees this one nor minds it.
-            for column in ("size REAL", "waited_on TEXT"):
+            for column in ("size REAL", "waited_on TEXT", "load_avg REAL"):
                 try:
                     self.conn.execute("ALTER TABLE runs ADD COLUMN " + column)
                 except sqlite3.OperationalError:
@@ -1100,6 +1131,9 @@ class Queue(object):
         # Not on the lease itself: leases are saved, and a reading from before
         # a restart says nothing about the minute just gone.
         self.stall_samples = {}
+        # lease id -> {"at", "cpu"}: the reading its `cpu_cores` on the page
+        # is the difference from. See lease_cpu.
+        self.cpu_samples = {}
         # (tree, script, arg) -> (enqueued_at, abandoned_at, waits) of a ticket
         # whose client went away, so a retry can pick its wait back up.
         self.parked = {}
@@ -1261,15 +1295,16 @@ class Queue(object):
                     "INSERT INTO runs (job_id, tree, tree_path, script, arg,"
                     " slots, gpu, exclusive, engines, exit, verdict, dur_s,"
                     " queued_s, eta_s, observed_max_procs, finished, daemon_sha,"
-                    " size, waited_on)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " size, waited_on, load_avg)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (row.get("id"), row.get("tree"), row.get("tree_path", ""),
                      row.get("script"), row.get("arg"), row.get("slots", 0),
                      row.get("gpu", 0), int(bool(row.get("exclusive"))),
                      row.get("engines", 0), row.get("exit"), row.get("verdict"),
                      row.get("dur_s"), row.get("queued_s"), row.get("eta_s"),
                      row.get("observed_max_procs", 0), row.get("finished"),
-                     self.sha, row.get("size"), row.get("waited_on")),
+                     self.sha, row.get("size"), row.get("waited_on"),
+                     row.get("load_avg")),
                 )
         except Exception as exc:
             sys.stderr.write("history write failed: %r\n" % (exc,))
@@ -1309,6 +1344,141 @@ class Queue(object):
             lease["observed_max_procs"] = max(
                 int(lease.get("observed_max_procs", 0)), self.observed
             )
+            # The load it is running under, as the mean of every look: see
+            # CONTENTION_PER_ENGINE.
+            lease["load_sum"] = float(lease.get("load_sum", 0.0)) + self.observed
+            lease["load_n"] = int(lease.get("load_n", 0)) + 1
+            self.lease_cpu(lease, table)
+
+    def lease_pids(self, lease, table):
+        """The processes a lease is judged by: its shell's subtree plus the
+        engines running out of its worktree, sparing what is under another
+        lease's shell. See stall_sample. Holds the lock."""
+        root = int(lease.get("winpid") or 0)
+        pids = subtree(table, root)
+        spared = set()
+        for other in self.other_shells(lease["id"]):
+            spared.update(subtree(table, other))
+        for pid, (_, name, cmdline, _) in table.items():
+            if pid in pids or pid in spared or GODOT_MATCH not in name.lower():
+                continue
+            if engine_of(pid, cmdline, lease.get("tree_path")) is not False:
+                pids.append(pid)
+        return pids
+
+    def lease_cpu(self, lease, table):
+        """Keep `cpu_cores` on a running lease: cores its processes burned
+        between two looks at least CPU_SAMPLE_SECONDS apart. Holds the lock.
+
+        For the page, and only for the page. "Is it working or hung" was
+        answered on 21 October by somebody reading a Godot's cpu time out of
+        WMI by hand, twice, a minute apart. The process table is read every
+        few seconds anyway and has the number in it. Nothing is killed on
+        this reading: that is stall_sample's, which is stricter about which
+        pids it compares.
+        """
+        if int(lease.get("winpid") or 0) not in table:
+            return
+        last = self.cpu_samples.get(lease["id"])
+        if last is not None and now() - last["at"] < CPU_SAMPLE_SECONDS:
+            return
+        cpu = dict((pid, table[pid][3]) for pid in self.lease_pids(lease, table))
+        self.cpu_samples[lease["id"]] = {"at": now(), "cpu": cpu}
+        if last is None or now() <= last["at"]:
+            return
+        burned = sum(max(0.0, cpu[pid] - last["cpu"][pid])
+                     for pid in cpu if pid in last["cpu"])
+        lease["cpu_cores"] = round(burned / (now() - last["at"]), 1)
+
+    def history_load(self, script, arg, tree_id):
+        """The load the runs an estimate comes from were measured at: the
+        median engines on the box over this job's recent runs, this
+        worktree's first. None when nobody knows. Each row's own average
+        where it has one, and the most it saw where it is older than that.
+        """
+        for where, args in (
+            ("script=? AND arg=? AND tree=?", (script, arg, tree_id)),
+            ("script=? AND arg=?", (script, arg)),
+        ):
+            try:
+                with db() as conn:
+                    rows = conn.execute(
+                        "SELECT COALESCE(load_avg, observed_max_procs) AS load"
+                        " FROM runs WHERE " + where +
+                        " AND verdict='released' AND dur_s > 0"
+                        " ORDER BY finished DESC LIMIT 9", args
+                    ).fetchall()
+            except Exception:
+                return None
+            loads = sorted(float(r["load"]) for r in rows if r["load"])
+            if len(loads) >= 2:
+                return loads[len(loads) // 2]
+        return None
+
+    def load_of(self, lease):
+        """The mean engines on the box while this lease has run, or what is
+        on it now before the first look."""
+        n = int(lease.get("load_n") or 0)
+        if n <= 0:
+            return float(self.observed)
+        return float(lease.get("load_sum", 0.0)) / n
+
+    def contention(self, lease):
+        """How much longer a busy box makes this lease than its estimate
+        says: 1.0 or more. See CONTENTION_PER_ENGINE."""
+        def cost(engines):
+            return 1.0 + CONTENTION_PER_ENGINE * max(0.0, float(engines) - 1.0)
+        if "eta_load" not in lease:
+            # Granted by a daemon from before eta_load, and handed over.
+            lease["eta_load"] = self.history_load(
+                lease.get("script", ""), lease.get("arg", ""), lease.get("tree_id", ""))
+        measured = lease.get("eta_load") or 1.0
+        return max(1.0, cost(self.load_of(lease)) / cost(measured))
+
+    def eta_now(self, lease):
+        """A running lease's estimate on the box it is running on now."""
+        eta = lease.get("eta_s")
+        if eta is None:
+            return None
+        return float(eta) * self.contention(lease)
+
+    def progress_stalls(self):
+        """Ids of the leases whose reported progress has not moved for their
+        stall window, if anybody is waiting. Holds the lock. See
+        PROGRESS_STALL_SECONDS."""
+        if not self.queue:
+            return []
+        return [lease_id for lease_id, lease in self.leases.items()
+                if lease.get("progress_moved_at") and not lease.get("idle_ok")
+                and now() - float(lease["progress_moved_at"])
+                > self.stall_window(lease)]
+
+    def stall_window(self, lease):
+        return float(lease.get("stall_s") or PROGRESS_STALL_SECONDS)
+
+    def progress(self, lease_id, done, total=0, unit=""):
+        """Record how far through its work a running job is. False for a
+        lease this daemon does not have.
+
+        The count moving is what matters, so that is the time kept:
+        `progress_moved_at` changes only when `done` does. A count that goes
+        DOWN has started something new, and that is movement too.
+        """
+        with self.lock:
+            lease = self.leases.get(lease_id)
+            if lease is None:
+                return False
+            if done != lease.get("progress_done") or not lease.get("progress_moved_at"):
+                lease["progress_moved_at"] = now()
+            lease["progress_done"] = done
+            lease["progress_total"] = total if total > 0 else 0
+            lease["progress_unit"] = unit
+            lease["progress_at"] = now()
+            # A run that reports has said how it is to be judged. A reading
+            # of its cpu from before that says nothing now.
+            lease.pop("quiet_since", None)
+            self.stall_samples.pop(lease_id, None)
+            return True
 
     def engines_outside(self, table):
         """The engines no running job accounts for, grouped by the worktree
@@ -1396,11 +1566,12 @@ class Queue(object):
             self.log_outside()
             suspects = self.stall_suspects()
             overrun = self.ceiling_breaches()
+            stuck = self.progress_stalls()
         # Outside the lock: spawning a process is not something to hold the
         # scheduler for, and nothing below touches queue state.
         self.follow_tray(busy)
-        if suspects or overrun:
-            self.rescue_stalled(suspects, overrun)
+        if suspects or overrun or stuck:
+            self.rescue_stalled(suspects, overrun, stuck)
         return granted
 
     def log_outside(self):
@@ -1439,10 +1610,16 @@ class Queue(object):
                 # A window somebody is meant to be looking at. Its client said
                 # so; the ceiling is still there for it.
                 continue
-            eta = lease.get("eta_s")
+            if lease.get("progress_moved_at"):
+                # It says how far it has got, and that is what it is judged
+                # by: see progress_stalls.
+                continue
+            # Late on the box it is running on, not the one its estimate was
+            # measured on.
+            eta = self.eta_now(lease)
             limit = STALL_UNKNOWN_SECONDS
             if eta is not None:
-                limit = max(STALL_FLOOR_SECONDS, STALL_ETA_FACTOR * float(eta))
+                limit = max(STALL_FLOOR_SECONDS, STALL_ETA_FACTOR * eta)
             if now() - float(lease.get("granted_at") or now()) <= limit:
                 continue
             last = self.stall_samples.get(lease_id)
@@ -1491,19 +1668,9 @@ class Queue(object):
         that runs a hundred four-second engines can put a whole one between two
         readings, and its cpu time leaves the table with it.
         """
-        root = int(lease.get("winpid") or 0)
-        if root not in table:
+        if int(lease.get("winpid") or 0) not in table:
             return False
-        pids = subtree(table, root)
-        spared = set()
-        for other in self.other_shells(lease["id"]):
-            spared.update(subtree(table, other))
-        for pid, (_, name, cmdline, _) in table.items():
-            if pid in pids or pid in spared or GODOT_MATCH not in name.lower():
-                continue
-            if engine_of(pid, cmdline, lease.get("tree_path")) is not False:
-                pids.append(pid)
-        cpu = dict((pid, table[pid][3]) for pid in pids)
+        cpu = dict((pid, table[pid][3]) for pid in self.lease_pids(lease, table))
         last = self.stall_samples.get(lease["id"])
         self.stall_samples[lease["id"]] = {"at": now(), "cpu": cpu}
         if last is None:
@@ -1518,16 +1685,17 @@ class Queue(object):
         lease.setdefault("quiet_since", last["at"])
         return now() - lease["quiet_since"] >= STALL_QUIET_SECONDS
 
-    def rescue_stalled(self, suspects, overrun=()):
+    def rescue_stalled(self, suspects, overrun=(), stuck=()):
         """Kill a lease that is in somebody's way and is not coming back, and
         hand its slots on. Takes the lock itself, and not around the slow
         parts.
 
-        Two ways to qualify. `suspects` are late and get their processes read;
-        one that has sat idle long enough is `stalled`. `overrun` are past
-        their ceiling and are not read at all -- a run spinning in a loop
-        looks exactly like work, which is what the ceiling is for -- and those
-        are `overran`.
+        Three ways to qualify. `suspects` are late and get their processes
+        read; one that has sat idle long enough is `stalled`. `stuck` said
+        how far through its work it was and has not moved since, which is
+        `stalled` too, and needs no reading. `overrun` are past their ceiling
+        and are not read at all -- a run spinning in a loop looks exactly like
+        work, which is what the ceiling is for -- and those are `overran`.
 
         Only with a queue, either way. A hung run on an otherwise empty box is
         costing nobody anything, and it may be a window somebody is looking
@@ -1558,6 +1726,19 @@ class Queue(object):
                     doomed.append((dict(lease), self.other_shells(lease_id),
                                    "stalled", "idle for %ds"
                                    % (now() - lease["quiet_since"])))
+            for lease_id in stuck:
+                lease = self.leases.get(lease_id)
+                if (lease is None or not waiting
+                        or any(d[0]["id"] == lease_id for d in doomed)):
+                    continue
+                total = lease.get("progress_total") or 0
+                doomed.append((dict(lease), self.other_shells(lease_id),
+                               "stalled", "no progress for %ds, at %d%s%s"
+                               % (now() - lease["progress_moved_at"],
+                                  lease.get("progress_done") or 0,
+                                  " of %d" % total if total else "",
+                                  " " + lease["progress_unit"]
+                                  if lease.get("progress_unit") else "")))
             for lease_id in overrun:
                 lease = self.leases.get(lease_id)
                 if (lease is None or not waiting
@@ -1581,11 +1762,15 @@ class Queue(object):
         with self.lock:
             for lease, _, verdict, _ in doomed:
                 if self.finish(lease["id"], None, verdict):
+                    advice = (" If it was meant to take that long, say so with"
+                              " max_s (maxSeconds), or idle_ok (idleOk) for a"
+                              " window that is meant to sit there.")
+                    if lease.get("progress_moved_at") and verdict == "stalled":
+                        advice = (" If one step can honestly take that long,"
+                                  " say so with stall_s (--stall, stallSeconds).")
                     self.notes[lease.get("tree_id", "")] = (
                         "testq killed your last run here -- " + lease["note"]
-                        + ". If it was meant to take that long, say so with"
-                        " max_s (maxSeconds), or idle_ok (idleOk) for a window"
-                        " that is meant to sit there.", now())
+                        + "." + advice, now())
             self.grant_pass()
             self.save_state()
             self.changed.notify_all()
@@ -1669,7 +1854,7 @@ class Queue(object):
                 return 0.0
             if started is None:
                 return float(eta)
-            return max(15.0, float(eta) - (now() - float(started)))
+            return max(15.0, self.eta_now(job) - (now() - float(started)))
 
         need_cpu, need_gpu = self.need_of(ticket)
         ahead = order[:order.index(ticket)] if ticket in order else []
@@ -2085,6 +2270,9 @@ class Queue(object):
             # Seconds queued, by what for: see waiting_on.
             "waited_on": json.dumps(job["waits"]) if job.get("waits") else None,
             "observed_max_procs": job.get("observed_max_procs", 0),
+            # The mean the estimates of later runs are stretched against.
+            "load_avg": (round(job["load_sum"] / job["load_n"], 2)
+                         if job.get("load_n") else None),
             "finished": now(),
         }
 
@@ -2099,6 +2287,7 @@ class Queue(object):
             exit_code = None
             verdict = "orphaned" if lease.get("cancel_why") == "orphan" else "cancelled"
         self.stall_samples.pop(lease_id, None)
+        self.cpu_samples.pop(lease_id, None)
         for key in list(self.held_mutex):
             if self.held_mutex[key] == lease_id:
                 del self.held_mutex[key]
@@ -2129,11 +2318,15 @@ class Queue(object):
             eta = body.get("eta_s")
             if eta is None:
                 eta = self.estimate(script, arg, tree_id, body)
-            max_s = body.get("max_s")
+            max_s, stall_s = body.get("max_s"), body.get("stall_s")
             try:
                 max_s = float(max_s) if max_s else None
             except (TypeError, ValueError):
                 max_s = None
+            try:
+                stall_s = float(stall_s) if stall_s else None
+            except (TypeError, ValueError):
+                stall_s = None
             # More than the whole box means the whole box. A client that
             # remembers a bigger one would otherwise wait for ever.
             slots_val = min(max(0, int(body.get("slots", 1))), self.capacity["cpu"])
@@ -2164,12 +2357,22 @@ class Queue(object):
                 "last_poll": now(),
                 "granted_at": None,
                 "eta_s": eta,
+                # The engines on the box when the runs `eta_s` came from were
+                # measured, for eta_now. None for an estimate that is not
+                # out of the history, which is taken as a quiet box.
+                "eta_load": (None if body.get("eta_s") is not None
+                             else self.history_load(script, arg, tree_id)),
                 # How much work this is, in whatever the job counts in --
                 # seconds to record, scenarios to shoot. See sized_estimate.
                 "size": arg_size(arg, body.get("size"))[1],
                 # See ceiling_of and stall_suspects.
                 "max_s": max_s,
+                # See PROGRESS_STALL_SECONDS. Only read once it reports.
+                "stall_s": stall_s,
                 "idle_ok": bool(body.get("idle_ok", False)),
+                # Which copy of a client asked, so a stale vendored one can be
+                # found: 0 for one older than the field.
+                "client": int(body.get("client", 0) or 0),
                 "blocked_on": "",
                 "wait_mark": now(),
                 "observed_max_procs": 0,
@@ -2231,6 +2434,15 @@ class Queue(object):
         # Prefer this worktree's own history, because a branch mid-feature can
         # be genuinely slower than its neighbours; fall back to every worktree
         # so a fresh checkout still gets a number on its first run.
+        #
+        # A flexible job's runs were granted different widths, so what is
+        # compared is the WORK (seconds times the slots each run was granted),
+        # and the estimate is that work at the width asked for now: a project
+        # that moved `run_test.sh all` from one engine to four would otherwise
+        # be estimated off its old one-engine runs, four times too long, and
+        # try_shrink would weigh four times the work. A rigid job always gets
+        # the width it asks for, so for it this is the plain median.
+        want = max(1, min(int(body.get("slots", 1) or 1), self.capacity["cpu"]))
         for where, args in (
             ("script=? AND arg=? AND tree=?", (script, arg, tree_id)),
             ("script=? AND arg=?", (script, arg)),
@@ -2238,15 +2450,15 @@ class Queue(object):
             try:
                 with db() as conn:
                     row = conn.execute(
-                        "SELECT dur_s FROM runs WHERE " + where +
+                        "SELECT dur_s, slots FROM runs WHERE " + where +
                         " AND verdict='released' AND dur_s > 0"
                         " ORDER BY finished DESC LIMIT 9", args
                     ).fetchall()
             except Exception:
                 return None
             if len(row) >= 2:
-                durations = sorted(float(r["dur_s"]) for r in row)
-                return round(durations[len(durations) // 2], 1)
+                work = sorted(float(r["dur_s"]) * max(1, int(r["slots"] or 1)) for r in row)
+                return round(work[len(work) // 2] / want, 1)
         # Last, the script with any argument at all. Wrong by a lot for a
         # script whose arguments differ by a lot, and still better than
         # nothing: a job with no estimate sorts behind everything that has
@@ -2421,6 +2633,15 @@ class Queue(object):
             for lease in sorted(self.leases.values(), key=lambda l: l.get("granted_at") or 0):
                 row = dict(lease)
                 row["elapsed_s"] = round(now() - lease["granted_at"], 1) if lease.get("granted_at") else 0
+                # The estimate on the box as it is: see eta_now. `busy` says
+                # whether that is worth saying out loud.
+                eta = self.eta_now(lease)
+                factor = self.contention(lease)
+                row["eta_now_s"] = round(eta, 1) if eta is not None else None
+                row["load_avg"] = round(self.load_of(lease), 1)
+                row["load_factor"] = round(factor, 2)
+                row["busy"] = not_granted_flag(factor >= CONTENTION_SHOWN)
+                row["stall_window_s"] = self.stall_window(lease)
                 running.append(row)
             queued = []
             for i, ticket in enumerate(order):
@@ -2574,6 +2795,24 @@ def acquire_reply(queue, ticket):
     }
 
 
+def progress_reply(queue, body):
+    """(status, reply) for POST /progress.
+
+    Not a PROTO bump: a daemon older than this answers 404, and the clients
+    send it and forget it either way. Its reply is 1 or 0 like every reply
+    that is not a grant (see not_granted_flag).
+    """
+    try:
+        done = max(0, int(body.get("done") or 0))
+        total = max(0, int(body.get("total") or 0))
+    except (TypeError, ValueError):
+        return 400, {"error": "done and total are counts"}
+    if not queue.progress(str(body.get("lease", "")), done, total,
+                          str(body.get("unit") or "")[:24]):
+        return 404, {"error": "no such lease"}
+    return 200, {"progress": not_granted_flag(True)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "testq/1"
     queue = None
@@ -2667,6 +2906,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/release":
             ok = self.queue.release(str(body.get("lease", "")), body.get("exit_code"))
             return self._send(200, {"released": ok})
+        if path == "/progress":
+            return self._send(*progress_reply(self.queue, body))
         if path == "/cancel":
             what = self.queue.cancel(str(body.get("job", "")), str(body.get("why", "")))
             if what is None:
@@ -2802,6 +3043,7 @@ UI_HTML = r"""<!doctype html>
   button:hover { border-color: var(--bad); color: var(--bad); }
   .exit0 { color: var(--ok); } .exit1 { color: var(--bad); }
   .exit2 { color: var(--warn); } .exitx { color: var(--grey); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
   .empty { color: var(--dim); font-style: italic; padding: 6px 8px; }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
          background: var(--ok); margin-right: 7px; }
@@ -2845,6 +3087,7 @@ function esc(t) {
   return String(t === null || t === undefined ? "" : t).replace(/[&<>"]/g,
     c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 }
+function num(n) { return Number(n || 0).toLocaleString("en-US"); }
 function job(j) { return esc(j.script) + (j.arg ? " " + esc(j.arg) : ""); }
 // Worktree names alone stopped being enough once more than one project shared
 // the box: two repos can both have a branch worktree called `godot-fixes`.
@@ -2897,21 +3140,64 @@ function render(s) {
     return (q.start_in_floor ? "&ge; " : "~") + dur(Math.max(0, q.start_in_s - drift));
   }
 
+  // "Is it working or hung?", answered from what the daemon already knows: the
+  // count the job reports if it reports one, else the cpu its processes burn.
+  function health(r) {
+    const at = s.now + drift;
+    if (r.progress_moved_at) {
+      const still = at - r.progress_moved_at;
+      if (still < 120) return "<span class='ok'>working</span>";
+      return "<span class='" + (still > r.stall_window_s / 2 ? "bad" : "warn") +
+        "'>no progress " + dur(still) + "</span>" +
+        "<span class='tag'> of " + dur(r.stall_window_s) + "</span>";
+    }
+    if (r.quiet_since) return "<span class='bad'>idle " + dur(at - r.quiet_since) + "</span>";
+    if (r.cpu_cores == null) return "<span class='tag'>--</span>";
+    // Half a core is the stall rule's line for working. Under a tenth is an
+    // engine doing nothing at all; between is a test awaiting frames, and also
+    // a hung window, which is why it gets no colour either way.
+    const word = r.cpu_cores >= 0.5 ? "<span class='ok'>busy</span>"
+      : r.cpu_cores >= 0.1 ? "<span>light</span>" : "<span class='warn'>quiet</span>";
+    return word + "<span class='tag'> " + r.cpu_cores.toFixed(1) + " cpu</span>";
+  }
+  function progress(r, el) {
+    const eta = r.eta_now_s || r.eta_s;
+    // A count with a total says how long is left better than any estimate.
+    const label = eta && !r.progress_total ? "~" + dur(eta) + (r.busy ? ", busy box" : "") : "";
+    const title = r.busy ? ' title="estimate ' + dur(r.eta_s) + ', measured with ' +
+      (r.eta_load || 1) + ' engine(s) on the box; ' + r.load_avg + ' on it now"' : "";
+    const unit = r.progress_unit ? " " + esc(r.progress_unit) : "";
+    let pct = null, over = false, text = "";
+    if (r.progress_total) {
+      pct = Math.min(100, 100 * r.progress_done / r.progress_total);
+      text = num(r.progress_done) + " / " + num(r.progress_total) + unit;
+      // Left, off the job's own pace so far: rows are not all one length,
+      // and it still beats an estimate from a quieter box.
+      if (r.progress_done / r.progress_total >= 0.05 && r.progress_done < r.progress_total)
+        text += " &middot; ~" + dur(el * (r.progress_total / r.progress_done - 1)) + " left";
+    } else if (r.progress_moved_at) {
+      text = num(r.progress_done) + unit + " done";
+    }
+    if (pct === null && eta) {
+      pct = Math.min(100, 100 * el / eta);
+      over = el > eta;
+    }
+    if (pct === null) return '<span class="tag">' + (text || "no estimate") + "</span>";
+    return '<div class="bar"><span class="' + (over ? "over" : "") + '" style="width:' +
+      pct + '%"></span></div><span class="tag"' + title + ">" +
+      (text ? text + (label ? " &middot; " : "") : "") + label + "</span>";
+  }
+
   if (!s.running.length) $("running").innerHTML = '<div class="empty">nothing running</div>';
   else $("running").innerHTML = '<table><tr><th>Worktree</th><th>Job</th><th>Slots</th>' +
-    '<th>Elapsed</th><th style="width:180px">Progress</th><th></th></tr>' +
+    '<th>Elapsed</th><th>State</th><th style="width:260px">Progress</th><th></th></tr>' +
     s.running.map(r => {
       const el = (r.elapsed_s || 0) + drift;
-      const pct = r.eta_s ? Math.min(100, 100 * el / r.eta_s) : 0;
-      const over = r.eta_s && el > r.eta_s;
       return "<tr><td class='mono'>" + who(r) + "</td><td>" + job(r) + "</td>" +
         "<td class='tag'>" + (r.exclusive ? "exclusive" : r.slots + " cpu" +
           (r.gpu ? " + gpu" : "")) + "</td>" +
-        "<td class='mono'>" + dur(el) + (r.quiet_since ? " <span class='tag'>idle " +
-          dur(s.now + drift - r.quiet_since) + "</span>" : "") + "</td>" +
-        "<td>" + (r.eta_s ? '<div class="bar"><span class="' + (over ? "over" : "") +
-          '" style="width:' + pct + '%"></span></div><span class="tag">~' + dur(r.eta_s) +
-          "</span>" : '<span class="tag">no estimate</span>') + "</td>" +
+        "<td class='mono'>" + dur(el) + "</td><td>" + health(r) + "</td>" +
+        "<td>" + progress(r, el) + "</td>" +
         "<td><button onclick=\"cancel('" + r.id + "','" + job(r) + "')\">cancel</button></td></tr>";
     }).join("") + "</table>";
 
@@ -3425,6 +3711,29 @@ def fmt_dur(s):
     return "%dm%02ds" % (s // 60, s % 60)
 
 
+def run_aside(r, at):
+    """What `status` says after a running job's id: how far it has got, and
+    whether it looks to be working. The page's State and Progress columns."""
+    aside = []
+    if r.get("busy"):
+        aside.append("busy box, was ~%s" % fmt_dur(r.get("eta_s")))
+    unit = (" " + r["progress_unit"]) if r.get("progress_unit") else ""
+    if r.get("progress_total"):
+        aside.append("{:,} / {:,}{}".format(r.get("progress_done") or 0,
+                                           r["progress_total"], unit))
+    elif r.get("progress_moved_at"):
+        aside.append("{:,}{} done".format(r.get("progress_done") or 0, unit))
+    if r.get("progress_moved_at"):
+        still = at - r["progress_moved_at"]
+        aside.append("working" if still < PROGRESS_FRESH_SECONDS
+                     else "no progress " + fmt_dur(still))
+    elif r.get("quiet_since"):
+        aside.append("idle " + fmt_dur(at - r["quiet_since"]))
+    elif r.get("cpu_cores") is not None:
+        aside.append("%.1f cpu" % r["cpu_cores"])
+    return "  " + ", ".join(aside) if aside else ""
+
+
 def cmd_status(args):
     port = port_from_env(args.port)
     code, state = http_json(port, "/state")
@@ -3442,13 +3751,11 @@ def cmd_status(args):
              state["godot"]["observed"],
              "  (%s)" % ", ".join(aside) if aside else ""))
     for r in state["running"]:
-        idle = ""
-        if r.get("quiet_since"):
-            idle = "  idle " + fmt_dur(state["now"] - r["quiet_since"])
         print("  RUN   %-34s %-16s %8s / %-8s %s%s"
               % (r["tree_id"][:34], (r["script"] + " " + (r["arg"] or "")).strip(),
-                 fmt_dur(r.get("elapsed_s")), fmt_dur(r.get("eta_s")), r["id"],
-                 idle))
+                 fmt_dur(r.get("elapsed_s")),
+                 fmt_dur(r.get("eta_now_s", r.get("eta_s"))), r["id"],
+                 run_aside(r, state["now"])))
     for q in state["queued"]:
         starts = ""
         if q.get("start_in_s") is not None:
