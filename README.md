@@ -685,6 +685,36 @@ first windowed job behind is asked: if it cannot take the window (a measurement
 waiting for all of them, a mutex), nothing behind it can, and the hold is off. With no
 window free, or when both fit, nothing changes.
 
+**A short job goes ahead of a head that is still collecting (backfill).** A
+wide job at the head reserves the slots it needs, and everything behind it
+used to wait even when it could never matter: on 2026-10-21 the box showed
+`7/8 cpu  0/3 gpu`, a four-slot `run_test.sh` was collecting at the head, and
+eight one-slot shots (about two minutes each, with estimates) sat 10-40
+minutes behind it, with a slot and all three windows idle. The head could not
+start before the seven running leases ended (about 1000 s), and a shot is gone
+in 120. So a job behind a reserving head starts now if it fits in what is free
+right now **and** cannot delay the head: either its estimate ends before the
+moment the head can start (when enough running leases are estimated to end to
+give it its slots: that is 1000 s here, the shot's 120 s fits), or it takes
+only slots the head will not need even then (a lease of five slots ending
+leaves the four-slot head three spare, so a one-slot job may sit in one
+indefinitely). The head loses nothing: by the time its slots are free, the
+backfilled job's slot is free too, or was never one of the head's.
+
+It errs on the side of the head. A job with no estimate backfills only into
+spare slots, never into one the head is waiting for (it could run for hours).
+A running lease with no estimate counts as ending in 15 s, not in twenty-three
+days, so it does not make the head's wait look long enough to slip a job under.
+Nothing backfills into the drain for an exclusive job, an exclusive job never
+backfills, a mutex that is held or reserved still blocks, and a job that has
+aged is no different from before. A GPU the head is not booking is free to
+windowed jobs; one it is booking is already held back. The same windows-first
+rule as above applies: if a CPU-only job and a windowed one could both
+backfill, the window is not left idle for the CPU job. A backfilled job's row on
+the page says `backfilled`, and its reason reads "backfilled: started early in a
+slot the job ahead is still collecting; it will be done before that job can
+start".
+
 ### Flexible width
 
 A multi-slot job used to be lumpy: four slots have to be free *at once*, so a

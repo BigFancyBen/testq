@@ -1956,6 +1956,67 @@ class Queue(object):
             return other_cpu <= free_cpu < other_cpu + need_cpu
         return False
 
+    def head_start(self, reserved_min, penalty):
+        """When the reservations ahead could be met, and what is spare then.
+        Holds the lock. Returns (seconds from now, cpu slots left over once
+        they are met).
+
+        Off the running leases' own estimates, the same floors as
+        eta_until_free (15 s for a lease already past its estimate) except
+        that a lease with NO estimate also counts as ending in 15 s, not in
+        twenty-three days: it could end any second, and a job that backfilled
+        on the strength of its not ending would be sitting in the slot the
+        head is waiting for. The seconds are inf when the leases never free
+        enough (the head is waiting on something else), and `spare` is
+        what is left of the freed slots after the head has its own.
+        """
+        used = sum(self.need_of(l)[0] for l in self.leases.values())
+        freed = max(0, self.capacity["cpu"] - used - penalty)
+        rel = []
+        for l in self.leases.values():
+            eta = l.get("eta_s")
+            remaining = 15.0 if eta is None else max(
+                15.0, float(eta) - (now() - float(l.get("granted_at") or now())))
+            rel.append((remaining, self.need_of(l)[0]))
+        rel.sort()
+        if freed >= reserved_min:
+            return 0.0, freed - reserved_min
+        for remaining, slots in rel:
+            freed += slots
+            if freed >= reserved_min:
+                return remaining, freed - reserved_min
+        return float("inf"), 0
+
+    def can_backfill(self, ticket, blocked_mutex, avail_cpu, free_gpu,
+                     reserved_min, penalty):
+        """Whether `ticket` may start now in capacity a reserving job ahead
+        of it is holding, without delaying that job. Holds the lock.
+
+        EASY backfill. A wide job collecting slots under its reservation
+        starts when enough running leases end, and that moment is known
+        (head_start). Anything that ends before it takes nothing the head
+        needs: its slot is back by then. Anything that outlives it may only
+        use slots the head does not need even then (`spare`). So on
+        2026-10-21, 7 of 8 slots taken, three windows idle, a four-slot
+        suite collecting at the head, eight two-minute shots waited 10-40
+        minutes for it: the head could not start before the long leases
+        ended, and the shots would be long gone by then.
+
+        Never for an exclusive job (it wants the whole box), a ticket
+        blocked on a mutex, or one with no estimate into a slot the head is
+        waiting for -- it could run for hours; it takes only spare slots.
+        """
+        if blocked_mutex or ticket.get("exclusive") or reserved_min <= 0:
+            return False
+        need_cpu, need_gpu = self.need_of(ticket)
+        if need_cpu > avail_cpu or need_gpu > free_gpu:
+            return False
+        shadow, spare = self.head_start(reserved_min, penalty)
+        if need_cpu <= spare:
+            return True
+        eta = ticket.get("eta_s")
+        return eta is not None and float(eta) < shadow
+
     def grant_pass(self):
         used_cpu = sum(self.need_of(l)[0] for l in self.leases.values())
         used_gpu = sum(self.need_of(l)[1] for l in self.leases.values())
@@ -1974,6 +2035,9 @@ class Queue(object):
         reserved_mutexes = set()
         reserved_cpu = 0
         reserved_gpu = 0
+        reserved_min = 0       # cpu the tickets ahead hold back, see can_backfill
+        draining = False       # an exclusive job is collecting the box
+        avail_cpu = free_cpu   # free_cpu before anything was held back
         order = self.order()
         for index, ticket in enumerate(order):
             need_cpu, need_gpu = self.need_of(ticket)
@@ -2018,10 +2082,36 @@ class Queue(object):
                                             free_gpu, reserved_gpu > 0):
                 need_cpu, need_gpu = self.need_of(ticket)
                 fits = True
+            # Backfill: a slot the head is collecting is not idle, but it is
+            # not needed until the head can start. See can_backfill.
+            backfilled = False
+            if not fits and reserved_min > 0 and not draining and self.can_backfill(
+                    ticket, blocked_mutex, avail_cpu, free_gpu, reserved_min,
+                    penalty):
+                # Windows first, as in gpu_hold: a CPU-only job does not
+                # take the slot a windowed job behind it could use.
+                first = next((o for o in order[index + 1:]
+                              if self.need_of(o)[1] > 0), None)
+                held = (need_gpu == 0 and first is not None
+                        and not self.is_aged(ticket)
+                        and self.gpu_hold(ticket, [first], avail_cpu, free_gpu,
+                                          reserved_mutexes)
+                        and self.can_backfill(
+                            first, any(k in self.held_mutex or k in reserved_mutexes
+                                       for k in first.get("mutexes", [])),
+                            avail_cpu, free_gpu, reserved_min, penalty))
+                if held:
+                    ticket["blocked_on"] = self.explain(ticket, "gpu_hold")
+                else:
+                    fits = backfilled = True
             if fits:
+                if backfilled:
+                    ticket["backfilled"] = True
+                    ticket["blocked_on"] = self.explain(ticket, "backfilled")
                 self.activate(ticket)
                 granted.append(ticket["id"])
-                free_cpu -= need_cpu
+                avail_cpu -= need_cpu
+                free_cpu = max(0, free_cpu - need_cpu)
                 free_gpu -= need_gpu
                 raw_cpu -= need_cpu
                 raw_gpu -= need_gpu
@@ -2061,10 +2151,16 @@ class Queue(object):
                              and need_gpu > free_gpu)
                 behind_gpu = (need_gpu > 0
                               and reserved_gpu + need_gpu > self.capacity["gpu"])
+                if ticket.get("exclusive"):
+                    # Nothing backfills into a drain: the box is emptying so
+                    # that this one runs alone, and its estimate is the least
+                    # trustworthy of all (a clock-skew measurement).
+                    draining = True
                 if ticket.get("exclusive") or not (gpu_alone or behind_gpu):
                     if free_cpu > 0:
                         ticket["accruing"] = True          # see gpu_hold
                     reserved_cpu += need_cpu
+                    reserved_min += need_cpu
                     free_cpu = max(0, free_cpu - need_cpu)
                 reserved_gpu += need_gpu
                 free_gpu = max(0, free_gpu - need_gpu)
@@ -2197,6 +2293,9 @@ class Queue(object):
             return "waiting for a quiet box"
         if reason == "gpu":
             return "waiting for the GPU"
+        if reason == "backfilled":
+            return ("backfilled: started early in a slot the job ahead is still collecting; "
+                    "it will be done before that job can start")
         if reason == "gpu_hold":
             return "waiting for a slot kept for a windowed job, so the GPU is not idle"
         if reason == "outside":
@@ -3195,7 +3294,9 @@ function render(s) {
       const el = (r.elapsed_s || 0) + drift;
       return "<tr><td class='mono'>" + who(r) + "</td><td>" + job(r) + "</td>" +
         "<td class='tag'>" + (r.exclusive ? "exclusive" : r.slots + " cpu" +
-          (r.gpu ? " + gpu" : "")) + "</td>" +
+          (r.gpu ? " + gpu" : "")) +
+        (r.backfilled ? " <span title='started early in a slot a wide job ahead is collecting; it ends before that job can start'>&middot; backfilled</span>" : "") +
+        "</td>" +
         "<td class='mono'>" + dur(el) + "</td><td>" + health(r) + "</td>" +
         "<td>" + progress(r, el) + "</td>" +
         "<td><button onclick=\"cancel('" + r.id + "','" + job(r) + "')\">cancel</button></td></tr>";
