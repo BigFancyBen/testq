@@ -2310,6 +2310,15 @@ class Queue(object):
         # Prefer this worktree's own history, because a branch mid-feature can
         # be genuinely slower than its neighbours; fall back to every worktree
         # so a fresh checkout still gets a number on its first run.
+        #
+        # A flexible job's runs were granted different widths, so what is
+        # compared is the WORK (seconds times the slots each run was granted),
+        # and the estimate is that work at the width asked for now: a project
+        # that moved `run_test.sh all` from one engine to four would otherwise
+        # be estimated off its old one-engine runs, four times too long, and
+        # try_shrink would weigh four times the work. A rigid job always gets
+        # the width it asks for, so for it this is the plain median.
+        want = max(1, min(int(body.get("slots", 1) or 1), self.capacity["cpu"]))
         for where, args in (
             ("script=? AND arg=? AND tree=?", (script, arg, tree_id)),
             ("script=? AND arg=?", (script, arg)),
@@ -2317,15 +2326,15 @@ class Queue(object):
             try:
                 with db() as conn:
                     row = conn.execute(
-                        "SELECT dur_s FROM runs WHERE " + where +
+                        "SELECT dur_s, slots FROM runs WHERE " + where +
                         " AND verdict='released' AND dur_s > 0"
                         " ORDER BY finished DESC LIMIT 9", args
                     ).fetchall()
             except Exception:
                 return None
             if len(row) >= 2:
-                durations = sorted(float(r["dur_s"]) for r in row)
-                return round(durations[len(durations) // 2], 1)
+                work = sorted(float(r["dur_s"]) * max(1, int(r["slots"] or 1)) for r in row)
+                return round(work[len(work) // 2] / want, 1)
         # Last, the script with any argument at all. Wrong by a lot for a
         # script whose arguments differ by a lot, and still better than
         # nothing: a job with no estimate sorts behind everything that has
