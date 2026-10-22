@@ -179,7 +179,7 @@ work and never exits then holds the GPU until somebody notices. With
 slot back, kills everything it started, and exits 124. The daemon enforces the
 same number as a backstop (see "A run that hangs is killed" below).
 
-Four optional fields say things only the job knows:
+Five optional fields say things only the job knows:
 
 | Field (Node / wire) | Meaning |
 |---|---|
@@ -187,6 +187,23 @@ Four optional fields say things only the job knows:
 | `maxSeconds` / `max_s` | The longest this may run once it starts. |
 | `idleOk` / `idle_ok` | A window that is meant to sit there. It will not be taken for a hang; `maxSeconds` still applies. |
 | `slotsMin` / `slots_min` | The narrowest a job can run on, for one whose engine count follows the width it is granted. See "Flexible width". |
+| `stallSeconds` / `stall_s` | For a job that reports progress: how long its count may stand still before it is taken for hung. Default 900. |
+
+**A job that can count its work should say how far it has got**, as often as
+is convenient:
+
+```js
+slot.progress(done, total, 'scenarios');   // never waits, never throws
+```
+
+The page then shows "212 / 3,104 rows" with the bar driven by it and a time
+left off the job's own pace, and the daemon judges the job by that count
+instead of by its cpu: a count that has not moved for `stallSeconds` with
+somebody waiting is a hang, and a count that moves is never killed as one
+(see "A run that hangs is killed" below). So once a job reports, it should
+keep reporting. The client sends at most one report in ten seconds and
+always the last one, so it is fine to call on every unit of work. `total` is
+`0` when nobody knows it.
 
 **Bash** — vendor `clients/testq.sh` the same way and source it:
 
@@ -198,14 +215,31 @@ timeout 1500 "$GODOT" --headless --path "$PROJ" -- --test="$WHICH"
 ```
 
 The flags are the same fields (`--cpu`, `--min-cpu`, `--gpu`, `--engines`,
-`--exclusive`, `--mutex`, `--size`, `--max`, `--idle-ok`, `--project`); the
-file's header lists them. The grant comes back in `$TESTQ_SLOTS` and
-`$TESTQ_BOX_ENGINES`. Put the `timeout` round each engine and never round the
-script, so that time spent queued is charged to nothing.
+`--exclusive`, `--mutex`, `--size`, `--max`, `--idle-ok`, `--stall`,
+`--project`); the file's header lists them. The grant comes back in
+`$TESTQ_SLOTS` and `$TESTQ_BOX_ENGINES`. Put the `timeout` round each engine
+and never round the script, so that time spent queued is charged to nothing.
+Progress is `testq_progress DONE [TOTAL] [UNIT]`, rate-limited the same way
+and sent in the background. **Do not count lines in the engine's log for
+it**: Godot's stdout reaches a pipe in blocks, so a count read off `tee`'s
+file stands still for minutes and then jumps. Have the engine write
+`done total` to a small file the script names in the environment, and
+forward that from a background loop — Oathkeep's `run_test.sh` and
+`tests/selftest.gd` (`OATH_PROGRESS_FILE`) are a worked example.
 
-Anything else speaks the protocol directly: `POST /acquire`, long-poll
-`POST /wait`, `POST /release`, all JSON, and the two clients are the reference
-for what to send. Read the reply's `granted` **field**. A client that looks
+Anything else speaks the protocol directly, all JSON, and the two clients
+are the reference for what to send:
+
+| Request | Body | Reply |
+|---|---|---|
+| `POST /acquire` | the job (above) | a ticket, and `granted` or where it is queued |
+| `POST /wait` | `ticket` | long-polls up to 25 s: granted, or still queued |
+| `POST /progress` | `lease`, `done`, `total`, `unit` | `{"progress": 1}`; 404 for a lease it does not have |
+| `POST /release` | `lease`, `exit_code` | `{"released": …}` |
+| `GET /state` | — | everything the page shows |
+
+`/progress` is newer than `PROTO` 1 and is not a bump: a daemon older than it
+answers 404, and both clients send it and forget it. Read the reply's `granted` **field**. A client that looks
 for the word `true` anywhere after the word `granted` — which is what the
 first bash client did, in thirty checkouts — takes a queued reply for a grant
 the day that reply grows a second yes-or-no, and runs on top of whatever it
@@ -288,6 +322,44 @@ so a script killed outright — or one whose failure path calls `exit` — costs
 queue nothing. Release explicitly anyway when you can: it is immediate, and it
 records the exit code.
 
+## Practices for clients
+
+The box is shared by every worktree of every project, so what one client does
+costs everyone's queue time. These are the habits that keep it moving, most
+of them learned the hard way:
+
+- **Keep the per-change run small.** The queue's biggest wait is not
+  scheduling, it is a rigid hour-long full suite booked by every worktree for
+  every push. Tier the tests: a change-scoped selection while working and
+  before a PR, the full suite on the main branch now and then (oathkeep:
+  `run_test.sh changed` gates a PR, `all` does not).
+- **Go wide flexibly, not rigidly.** Work that divides (suites, shards,
+  scenarios) should send `slots_min` and launch as many engines as it is
+  granted. Starting narrow when the box is busy beats waiting for four free
+  slots at once, and the daemon does that arithmetic for you.
+- **The cheapest job is the one never queued.** Cache verdicts in the client,
+  keyed by a hash of what the run loads, and share the cache across worktrees:
+  a suite that passed on the same files in another tree has passed here.
+  (oathkeep: `tests/test_cache.py`.)
+- **Report progress.** `testq_progress done total` (or a progress file the
+  wrapper forwards) is how the page tells a slow run from a hung one, and a
+  long job that says nothing looks hung to every agent reading the page.
+- **Time nothing on a shared box.** A wall-clock assertion means something
+  only at `TESTQ_BOX_ENGINES` = 1. A limit that must hold elsewhere scales
+  with that number, and a sharded run counts its own sibling shards.
+- **Stop the engine, not just the wrapper.** Killing a wrapper script (an
+  agent's "stop task", a closed terminal) can leave its Godot running: the
+  daemon reclaims the slot when the client dies, but the orphaned engine keeps
+  its CPU and shows up as unmanaged load. Find it by its `--path` and end it.
+  A wrapper that starts engines in the background should kill them in its
+  exit trap.
+- **Never put your own `timeout` around a queued script.** It counts the queue
+  wait too, and kills the client before it releases (see "What to tell the
+  agents").
+- **One kind of work per arg.** Estimates are the history of (script, arg);
+  an arg that means different amounts of work on different days (a diff-driven
+  selection) estimates badly. Declare `size` when you know it.
+
 ## Adding a project
 
 The queue only knows about the engines that ask it. One harness that launches
@@ -312,8 +384,22 @@ and cannot see, so the whole of the integration is making sure nothing does:
 6. **Do not teach `TESTQ=off`.** It is for debugging the queue itself. A
    headless suite does not need it to "stay off the GPU queue": a job that
    books no `gpu` is never in the GPU line.
-7. Optionally register the project in `projects.json` (below), for estimates
+7. **Report progress** if the run can count its work — test rows, scenarios,
+   frames. It is what lets the page say a slow run is still working, and the
+   daemon tell it from a hung one.
+8. Optionally register the project in `projects.json` (below), for estimates
    on a new worktree's first run and for `reap`.
+
+### Client versions
+
+The clients carry a version, sent as `client` with every acquire. A project
+on an older one keeps queueing exactly as it did; re-vendor to get what came
+after it.
+
+| Version | What it added |
+|---|---|
+| 1 | everything up to October 2026 (no version field: the daemon reads it as 0) |
+| 2 | progress (`testq_progress`, `slot.progress()`) and `--stall` / `stallSeconds`; 2026-10-21 |
 
 Check it with `python testq.py status` while the project's suite runs: the job
 should be a `RUN` line, and there should be no `OUT` line for its worktree.
@@ -355,12 +441,37 @@ job the queue killed itself shows there in red, as `killed: stalled` or
 stop the work (see below). `python testq.py status` is the same thing in the
 terminal.
 
+**A running job says whether it is working.** That was the one question the
+page could not answer: on 21 October a suite with a 41-minute estimate sat at
+53 minutes and the only way to tell it was fine was to read its Godot's cpu
+time out of WMI twice, a minute apart. Now the State column says it:
+
+- `working`, for a job whose reported count moved in the last two minutes,
+  and `no progress 6m of 15m00s` once it has stood still — amber, then red
+  past half its stall window.
+- For a job that reports nothing, the cores its shell and its worktree's
+  engines burned over the last ten seconds, off the process table the daemon
+  reads anyway: `busy 1.0 cpu` from half a core, `quiet 0.0 cpu` under a
+  tenth, and `light 0.2 cpu` between — a test awaiting frames idles there, and
+  so does a hung window, so a job that stays there is one to watch. Once a
+  late job is being watched for a hang it says `idle 4m` instead, as before.
+
+The Progress column is driven by the job's count when it reports one —
+`2,310 / 3,104 rows · ~9m left`, the time left off its own pace so far — and
+by its estimate when it does not. **The estimate is the one for the box as it
+is now**: a job running beside five engines whose history was measured beside
+one says `~55m, busy box`, and hovering on it gives both numbers. `status`
+prints the same on each `RUN` line:
+
+    RUN   accountability-idler-towntop   run_test.sh all   53m10s / 57m24s   J9671  busy box, was ~40m57s, 2,310 / 3,104 rows, working
+
 ## The history database
 
 Every finished job is written to `testq.db` in the runtime directory, a SQLite
 file with one `runs` table: which worktree, which script and argument, how long
 it ran, how long it waited, how it exited, and the most engines the box was
-carrying while it ran. It survives daemon restarts, worktree deletions and
+carrying while it ran (`observed_max_procs`) and on average (`load_avg`, from
+October 2026; it is what busy-box estimates compare against). It survives daemon restarts, worktree deletions and
 reboots, so it accumulates across sessions.
 
     python testq.py stats --days 7 [--tree NAME]
@@ -535,6 +646,8 @@ semaphore of size one would deadlock both on the first call.
 | mfrs `run_attach.sh` | – | – | – | no engine, never queued |
 | prognosticator `capture-warehouse.mjs` | 1 | 1 | 1 | windowed; releases when the engine exits, not when ffmpeg does |
 | prognosticator `godot-export-web.js` | 1 | – | 1 | two headless passes, one after the other |
+| oathkeep `run_test.sh <one selector>` | 1 | – | 1 | |
+| oathkeep `run_test.sh all` (or several selectors) | 1–4, flexible | – | = granted width | `SHARDS`, default 4; whole suites dealt out by last-run seconds |
 
 Queue order is **shortest first**, estimated from the `weights-<tree>.json` a
 suite writes, so a twenty-second tagged slice does not sit behind two
@@ -564,6 +677,14 @@ The client reads the width back (`$TESTQ_SLOTS` in bash, `slot.slots` in
 Node) and launches exactly that many engines — `run_test_par.sh` picks its
 shard count off the grant. A job whose engine count is fixed must never send
 `slots_min`.
+
+A flexible job's history estimate is its **work**, not its wall time: the
+median of seconds × slots granted over its recent runs, divided by the width
+it asks for now. So a project that moves a suite from one engine to four is
+estimated from its old runs at a quarter of their length, rather than four
+times too long until the old runs age out, and `try_shrink` weighs the right
+amount of work. A rigid job always gets its width, so for it this is the plain
+median.
 
 ## Design notes worth knowing
 
@@ -682,9 +803,40 @@ longest real run in three thousand being twenty minutes. Past it, with
 something queued, the run is killed whatever it is doing and the row says
 `overran`.
 
+**A run that reports progress is judged by its count, not its cpu.** Cpu
+cannot tell a slow run from a run spinning in one test for an hour, and a busy
+box makes every honest run late; a count that stops moving is the one thing a
+hung run cannot fake. So from its first report a run is never suspected on
+cpu or lateness at all. It is `stalled` when its count has not moved for
+`stall_s` — fifteen minutes unless the client said otherwise, so that one slow
+row cannot convict a suite — with something queued, however busy it looks and
+however early. A run whose count is moving is never stalled, only stopped at
+its ceiling. Reports that repeat the same count are not movement. A count
+that goes down has started something new, which is.
+
+**Late means late on this box.** The lateness that makes a run a suspect is
+measured against its estimate stretched for the load it is running under
+(see "Busy-box estimates" below), so a run slowed by five neighbours is not
+watched any sooner for it. The ceiling is not stretched: it is a backstop and
+should stay a number someone can work out.
+
 Either way the owner is usually an agent that sees only a dead process, so the
 reason is kept for half an hour and handed to that worktree's next `acquire`,
 which prints it. The tray raises a balloon for it too.
+
+**Busy-box estimates.** Every estimate is a run measured on some box, and the
+box is not always the same one: in the history `run_test.sh all` takes a
+median 504 s with one engine on the box and 673 s with five. That is about a
+tenth longer for each engine past the first (`CONTENTION_PER_ENGINE`), and a
+running job's estimate is stretched by how much busier the box is now — the
+mean engines over the run so far — than it was for the runs the estimate came
+from, the median of their own means. It is only ever stretched, never shrunk:
+rows from before this record the most engines a run saw rather than the
+average, which would make a quiet box look quieter than it is. An estimate
+that is not out of the history (a weights file, or the client's own `eta_s`)
+is taken as measured on a quiet box. The page says `busy box` once the
+stretch passes 15%; `start_in` uses the stretched number for what is running
+too.
 
 What is read, and what is killed, is the shell's process subtree plus the
 engines running out of the job's worktree. The second half is most of it for a
@@ -724,7 +876,7 @@ that can stop you testing is worse than the contention it was built to prevent.
 
     python -m unittest discover tests
 
-A hundred and twenty-seven tests, standard library only, a couple of seconds. They start no
+A hundred and fifty-one tests, standard library only, a few seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over
