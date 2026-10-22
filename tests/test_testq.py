@@ -1153,7 +1153,7 @@ class WaitedOn(Box):
 
     def test_a_slot_kept_for_a_job_in_front(self):
         self.job(script="run_test_par.sh", winpid=100, gpu=0, slots=6)
-        big = self.job(script="big.sh", winpid=200, gpu=0, slots=4, eta_s=10)
+        big = self.job(script="big.sh", winpid=200, gpu=0, slots=8, eta_s=10)
         small = self.job(script="small.sh", winpid=300, gpu=0, slots=1, eta_s=100)
         self.assertEqual(big["waiting_on"], "slots")
         self.assertFalse(self.running(small))
@@ -1490,9 +1490,15 @@ class GpuNotIdle(Box):
 
     def test_a_head_that_is_reserving_keeps_what_frees(self):
         leases = self.fill(8)
+        # Two outlast the rest, so six slots are free at 1000 s with none
+        # to spare.
+        for lease in leases[6:]:
+            lease["eta_s"] = 9000
         wide = self.job(script="run_test_par.sh", winpid=500, gpu=0, slots=6, eta_s=5)
-        short = self.job(script="quick.sh", winpid=501, gpu=0, slots=1, eta_s=10)
-        shot = self.job(script="run_shots.sh", winpid=502, gpu=1, slots=1, eta_s=100)
+        # Longer than the leases the head waits for, so they would delay it
+        # (test_backfill covers the ones that would not).
+        short = self.job(script="quick.sh", winpid=501, gpu=0, slots=1, eta_s=5000)
+        shot = self.job(script="run_shots.sh", winpid=502, gpu=1, slots=1, eta_s=5000)
         self.q.release(leases[0]["id"], 0)
         for ticket in (wide, short, shot):
             self.assertFalse(self.running(ticket))
@@ -1547,6 +1553,154 @@ class GpuNotIdle(Box):
         self.q.release(leases[0]["id"], 0)
         self.assertTrue(self.running(short))
         self.assertFalse(self.running(shot))
+
+
+class Backfill(Box):
+    """A job behind a reserving head starts in a free slot when it will be
+    gone before the head can start. 2026-10-21: 7/8 slots, three windows idle,
+    a four-slot suite collecting at the head, eight two-minute shots waiting
+    10-40 minutes behind it."""
+
+    GPUS = 3
+
+    def fill(self, n, eta=1000, **more):
+        leases = [self.job(script="cpu%d.sh" % i, winpid=1000 + i, gpu=0,
+                           slots=1, eta_s=eta, **more) for i in range(n)]
+        for lease in leases:
+            self.assertTrue(self.running(lease))
+        return leases
+
+    def head(self, slots=4, eta=30):  # 8 = none spare
+        head = self.job(script="run_test.sh", winpid=500, gpu=0, slots=slots,
+                        eta_s=eta)
+        self.assertFalse(self.running(head))
+        return head
+
+    def shot(self, i, eta=120, **more):
+        return self.job(script="run_shots.sh", arg="s%d" % i, winpid=600 + i,
+                        gpu=1, slots=1, eta_s=eta, **more)
+
+    def test_the_live_scenario_shots_start_and_the_head_is_not_delayed(self):
+        leases = self.fill(7)
+        head = self.head()
+        shots = [self.shot(i) for i in range(8)]
+        # The one idle slot and the idle windows: exactly one shot fits.
+        started = [t for t in shots if self.running(t)]
+        self.assertEqual(len(started), 1)
+        self.assertTrue(started[0]["backfilled"])
+        self.assertIn("backfilled", started[0]["blocked_on"])
+        self.assertFalse(self.running(head))
+        # Shots keep cycling through the idle slot, two minutes each. At
+        # 1000 s the leases the head waits for end; by then every shot is
+        # done (each ended long before), so the head starts the moment the
+        # third lease goes: nothing it needed was held.
+        for _ in range(7):
+            self.clock += 120
+            for shot in shots:
+                if self.running(shot):
+                    self.q.release(shot["id"], 0)
+        self.clock = 1000000.0 + 1000
+        for shot in shots:
+            if self.running(shot):
+                self.q.release(shot["id"], 0)
+        self.assertFalse(self.running(head))
+        for lease in leases[:2]:
+            self.q.release(lease["id"], 0)
+        self.assertFalse(self.running(head))
+        self.q.release(leases[2]["id"], 0)
+        self.assertTrue(self.running(head))
+        self.assertFalse(head.get("backfilled"))
+
+    def test_a_job_that_would_outlive_the_head_s_wait_does_not_backfill(self):
+        self.fill(7)
+        head = self.head(slots=8)
+        long = self.shot(0, eta=5000)
+        short = self.shot(1, eta=120)
+        self.assertFalse(self.running(long))
+        self.assertTrue(self.running(short))
+        self.assertEqual(long["blocked_on"], "waiting for slots")
+
+    def test_a_job_with_no_estimate_does_not_backfill_into_the_heads_slot(self):
+        self.fill(7)
+        self.head(slots=8)
+        blind = self.shot(0, eta=None)
+        self.assertFalse(self.running(blind))
+
+    def test_leases_without_an_estimate_could_end_any_second(self):
+        # Nothing says when they end, so the head's start is "now-ish" (15 s)
+        # and a two-minute shot would outlive it.
+        self.fill(7, eta=None)
+        self.head()
+        self.assertFalse(self.running(self.shot(0, eta=120)))
+        self.assertTrue(self.running(self.shot(1, eta=10)))
+
+    def test_slots_the_head_will_not_need_are_open_to_anyone(self):
+        # A five-slot lease and a one-slot lease: when the big one ends the
+        # head (four) has its slots with three to spare, so a long one-slot
+        # job, even without an estimate, takes nothing it needs.
+        big = self.job(script="big.sh", winpid=300, gpu=0, slots=5, eta_s=1000)
+        self.job(script="one.sh", winpid=301, gpu=0, slots=1, eta_s=1000)
+        head = self.head()
+        blind = self.shot(0, eta=None)
+        self.assertTrue(self.running(blind))
+        self.assertTrue(self.running(self.shot(1, eta=9000)))
+        self.q.release(big["id"], 0)
+        self.assertTrue(self.running(head))
+
+    def test_blind_backfillers_do_not_count_as_freeing_spare_slots(self):
+        # Capacity 8: a four-slot and a one-slot lease (1000 s), a six-slot
+        # head, three free. Spare at 1000 s is 8-6 = 2: two blind jobs may
+        # sit in it, and the third must not (it would be counted as freeing
+        # on the next pass and the head left waiting on blind jobs).
+        big = self.job(script="big.sh", winpid=300, gpu=0, slots=4, eta_s=1000)
+        one = self.job(script="one.sh", winpid=301, gpu=0, slots=1, eta_s=1000)
+        head = self.job(script="run_test.sh", winpid=500, gpu=0, slots=6, eta_s=30)
+        blinds = [self.job(script="b%d.sh" % i, winpid=700 + i, gpu=0, slots=1,
+                           eta_s=None) for i in range(3)]
+        self.assertEqual([self.running(b) for b in blinds], [True, True, False])
+        self.q.release(big["id"], 0)
+        self.assertFalse(self.running(head))      # the one-slot lease too
+        self.q.release(one["id"], 0)
+        self.assertTrue(self.running(head))
+
+    def test_a_cpu_job_leaves_the_slot_to_a_shot_when_both_could_backfill(self):
+        leases = self.fill(8)
+        self.head()
+        short = self.job(script="quick.sh", winpid=700, gpu=0, slots=1, eta_s=10)
+        shot = self.shot(0)
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(shot))
+        self.assertFalse(self.running(short))
+
+    def test_a_cpu_job_backfills_when_no_shot_can(self):
+        self.fill(7)
+        self.head()
+        short = self.job(script="quick.sh", winpid=700, gpu=0, slots=1, eta_s=10)
+        self.shot(0, eta=5000)
+        self.assertTrue(self.running(short))
+
+    def test_a_held_mutex_is_still_respected(self):
+        self.fill(6)
+        clip = self.job(script="clip.sh", winpid=400, gpu=1, slots=1, eta_s=50,
+                        mutexes=["clip:a"])
+        self.assertTrue(self.running(clip))
+        self.head()
+        twin = self.shot(0, mutexes=["clip:a"])
+        self.assertFalse(self.running(twin))
+
+    def test_nothing_backfills_into_a_drain_for_an_exclusive_job(self):
+        self.fill(3)
+        mp = self.job(script="run_mp.sh", winpid=500, gpu=3, slots=8,
+                      eta_s=30, exclusive=True)
+        self.assertFalse(self.running(mp))
+        self.assertFalse(self.running(self.shot(0)))
+
+    def test_an_exclusive_job_never_backfills(self):
+        self.fill(7)
+        self.head()
+        mp = self.job(script="run_mp.sh", winpid=501, gpu=3, slots=8,
+                      eta_s=30, exclusive=True)
+        self.assertFalse(self.running(mp))
 
 
 class Duplicates(Box):
