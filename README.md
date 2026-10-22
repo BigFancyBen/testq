@@ -567,7 +567,9 @@ and the slot falls to the windowed one (`gpu_hold`; the page says "waiting for
 a slot kept for a windowed job"). It is a hold, not a reservation, so it
 starves nobody: a job that has aged is never held, and neither is a wide job
 that is accruing slots under a reservation -- that reservation already took
-what was free, and the last slot it needs is not for a window to take. With no
+what was free, and the last slot it needs is not for a window to take. Only the
+first windowed job behind is asked: if it cannot take the window (a measurement
+waiting for all of them, a mutex), nothing behind it can, and the hold is off. With no
 window free, or when both fit, nothing changes.
 
 ### Flexible width
@@ -767,7 +769,7 @@ already gone when the script began was a deliberate detach (`nohup`,
 
 **`python testq.py cancel JOB... | --tree NAME`** is the same button from a
 terminal: ids are the ones `status` now prints, and `--tree` takes every
-*queued* job of the worktree whose id or path contains NAME. Running jobs are
+*queued* job of the worktree whose whole id (`hats-a1b2c3`) or name before the hash (`hats`) is NAME -- not a fragment, so a short name cannot reach another agent's jobs. It lists what it will cancel, and refuses a name two checkouts share. Running jobs are
 stopped by id only, one at a time, on purpose.
 
 **A job identical to one already queued from the same worktree is not queued
@@ -775,7 +777,7 @@ twice.** Same `tree_id`, script and arg while the first is still *queued* (a
 copy that is running does not count: that is how a suite is run again after an
 edit). A client that sends `"dedupe": 1` is answered `{"duplicate": 1,
 "existing": ID, "position": N, ...}` with no `ticket`, and both clients print
-the id and exit 6; `testq cancel ID` replaces it. Refusal rather than handing
+the id and exit 6, printing `=== RESULT: FAIL (exit 6) -- duplicate of ID queued from this tree ===` for anything parsing that line; `testq cancel ID` replaces it. Refusal rather than handing
 back the existing ticket: two callers sharing one ticket would both think they
 held the booking and one slot would run two jobs. A client that does not send
 `dedupe` (older ones) is queued as before, and the same client process asking
@@ -785,7 +787,7 @@ again after a lost reply gets its own ticket back.
 
     python -m unittest discover tests
 
-A hundred and sixty-two tests, standard library only, a couple of seconds. They start no
+A hundred and sixty-five tests, standard library only, a couple of seconds. They start no
 daemon, engine or process: the queue is driven through `Queue.tick()` on a fake
 clock against a dictionary shaped like the process table, so a test can
 describe a hung Godot in one line and watch what the daemon does about it over

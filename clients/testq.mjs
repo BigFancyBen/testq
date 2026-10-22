@@ -330,7 +330,12 @@ export async function acquire(job, requeues = 0) {
       `this exact job (${job.script} ${job.arg || ''}) is already queued from this worktree ` +
         `as ${held}, position ${request.body.position || '?'} — not queueing a second.`,
     );
-    warn(`    Wait for that one, or replace it: python testq.py cancel ${held}`);
+    warn(
+      `    If ${held} is not yours to wait on (another agent's, or a dead one's): ` +
+        `python testq.py cancel ${held}   and run this again.`,
+    );
+    process.stdout.write(`=== RESULT: FAIL (exit 6) -- duplicate of ${held} queued from this tree ===
+`);
     process.exit(6);
   }
   const ticket = request.body?.ticket;

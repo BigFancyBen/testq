@@ -176,6 +176,7 @@ class BashClient(ClientCase):
         self.assertEqual(proc.returncode, 6)
         self.assertIn("J9", proc.stderr)
         self.assertIn("already queued", proc.stderr)
+        self.assertIn("=== RESULT: FAIL (exit 6) -- duplicate of J9 queued from this tree ===", proc.stdout)
         self.assertEqual(daemon.acquires[0].get("dedupe"), 1)
         self.assertFalse(os.path.exists(os.path.join(self.dir, "ran")))
 
@@ -232,6 +233,7 @@ class NodeClient(ClientCase):
                               capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 6)
         self.assertIn("J9", proc.stderr)
+        self.assertIn("=== RESULT: FAIL (exit 6) -- duplicate of J9 queued from this tree ===", proc.stdout)
         self.assertEqual(daemon.acquires[0].get("dedupe"), 1)
         self.assertFalse(os.path.exists(os.path.join(self.dir, "ran")))
 

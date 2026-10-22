@@ -40,7 +40,7 @@ Subcommands:
   serve     run the HTTP server (internal -- `start` calls this)
   start     snapshot this file to the runtime dir and spawn `serve` detached
   status    one line per running and queued job
-  cancel    cancel jobs by id, or every queued job of a worktree (--tree)
+  cancel    cancel jobs by id, or every queued job of a worktree (--tree, exact)
   stop      ask the daemon to exit
   tray      pin the notification-area icon up (the daemon raises it by itself
             while the box is busy, so this is only for keeping it there)
@@ -1756,13 +1756,19 @@ class Queue(object):
         need_cpu = self.need_of(ticket)[0]
         for other in later:
             other_cpu, other_gpu = self.need_of(other)
-            if other_gpu <= 0 or other.get("exclusive") or other_gpu > free_gpu:
+            if other_gpu <= 0:
                 continue
-            if any(key in self.held_mutex or key in reserved_mutexes
-                   for key in other.get("mutexes", [])):
-                continue
-            if other_cpu <= free_cpu < other_cpu + need_cpu:
-                return True
+            # Only the first windowed job behind this one is asked. If it
+            # cannot take the window -- it wants more than are free (a
+            # measurement waiting to book them all, which reserves the GPU),
+            # wants a quiet box, or is blocked on a mutex -- then nothing
+            # behind it can either, since it holds the line's reservation, and
+            # holding this job would idle the slot until the aging floor.
+            if (other.get("exclusive") or other_gpu > free_gpu
+                    or any(key in self.held_mutex or key in reserved_mutexes
+                           for key in other.get("mutexes", []))):
+                return False
+            return other_cpu <= free_cpu < other_cpu + need_cpu
         return False
 
     def grant_pass(self):
@@ -3679,13 +3685,17 @@ def cmd_stats(args):
 
 
 def queued_for_tree(state, name):
-    """The queued tickets in a /state whose worktree matches `name`: a piece
-    of the tree id or of its path, any case. Queued only -- a run that has
-    started is stopped by its id, on purpose and one at a time."""
+    """The queued tickets in a /state whose worktree is `name`: its whole
+    tree id (`hats-a1b2c3`), or the name in front of the hash (`hats`), any
+    case. Not a substring: a short name must not reach another agent's jobs.
+    Queued only -- a run that has started is stopped by its id, on purpose and
+    one at a time."""
     name = name.lower()
-    return [q for q in state.get("queued", [])
-            if name in (q.get("tree_id") or "").lower()
-            or name in (q.get("tree_path") or "").lower()]
+
+    def is_it(tree_id):
+        tree_id = (tree_id or "").lower()
+        return tree_id == name or tree_id.rpartition("-")[0] == name
+    return [q for q in state.get("queued", []) if is_it(q.get("tree_id"))]
 
 
 def cmd_cancel(args):
@@ -3706,6 +3716,17 @@ def cmd_cancel(args):
         found = queued_for_tree(state, args.tree)
         if not found:
             print("no queued jobs for a worktree matching %r" % args.tree)
+        trees = sorted(set(q.get("tree_id") for q in found))
+        if len(trees) > 1:
+            # Two checkouts called the same thing: do not guess whose.
+            print("%r is more than one worktree; give the whole id:" % args.tree)
+            for tree in trees:
+                path = next(q.get("tree_path") for q in found if q.get("tree_id") == tree)
+                print("  %s  %s" % (tree, path))
+            return 2
+        for q in found:
+            print("will cancel %s  %s  %s %s" % (q["id"], q.get("tree_id"),
+                                                 q.get("script"), q.get("arg") or ""))
         ids += [q["id"] for q in found if q["id"] not in ids]
     if not ids:
         if not args.tree:
@@ -3891,7 +3912,7 @@ def main(argv):
     p = sub.add_parser("cancel", help="cancel jobs by id, or all of a worktree's queued ones")
     p.add_argument("jobs", nargs="*", metavar="JOB", help="job ids, as `status` prints them")
     p.add_argument("--tree", default="", metavar="NAME",
-                   help="every queued job of the worktree whose name contains this")
+                   help="every queued job of the worktree with this id, or this name before the hash")
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(fn=cmd_cancel)
 

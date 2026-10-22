@@ -261,6 +261,13 @@ _testq_watch_starter() { # _testq_watch_starter <lease>
       if _testq_orphaned; then
         _testq_post cancel "{\"job\":\"$lease\",\"why\":\"orphan\"}" 70 >/dev/null
         sleep 3
+        # The script's children first (the engine it is blocked on), then the
+        # script: killing only the script leaves its Godot running. MSYS has
+        # no reliable process-group kill, so walk /proc for its direct children.
+        local d
+        for d in /proc/[0-9]*; do
+          [ "$(cat "$d/ppid" 2>/dev/null)" = "$me" ] && kill "${d#/proc/}" 2>/dev/null
+        done
         kill "$me" 2>/dev/null
         break
       fi
@@ -350,8 +357,10 @@ testq_acquire() {
     # Asked for a job this worktree already has queued. Not queued twice: two
     # copies of one job is what an agent that lost track of its first
     # command does, and the second only makes the first wait longer.
-    echo "!!! this exact job ($script $arg) is already queued from this worktree as $(_testq_str "$resp" existing), position $(_testq_num "$resp" position) -- not queueing a second." >&2
-    echo "    Wait for that one, or replace it: python testq.py cancel $(_testq_str "$resp" existing)" >&2
+    local held; held="$(_testq_str "$resp" existing)"
+    echo "!!! this exact job ($script $arg) is already queued from this worktree as $held, position $(_testq_num "$resp" position) -- not queueing a second." >&2
+    echo "    If $held is not yours to wait on (another agent's, or a dead one's): python testq.py cancel $held   and run this again." >&2
+    echo "=== RESULT: FAIL (exit 6) -- duplicate of $held queued from this tree ==="
     exit 6
   fi
   ticket="$(_testq_str "$resp" ticket)"

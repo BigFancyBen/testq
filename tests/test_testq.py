@@ -1289,6 +1289,20 @@ class GpuNotIdle(Box):
         self.assertTrue(self.running(short))               # twin cannot start anyway
         self.assertFalse(self.running(twin))
 
+    def test_a_measurement_waiting_for_the_card_does_not_hold_the_line(self):
+        # A window is in use, so run_perf's ask for all three waits and
+        # reserves the GPU; the shot behind it cannot start either. Holding
+        # the CPU job for that shot would idle the slot until aging.
+        leases = self.fill(7, gpu=1)
+        short = self.job(script="quick.sh", winpid=500, gpu=0, slots=1, eta_s=10)
+        perf = self.job(script="run_perf.sh", winpid=501, gpu=3, slots=1, eta_s=20)
+        shot = self.job(script="run_shots.sh", winpid=502, gpu=1, slots=1, eta_s=100)
+        self.assertEqual([t["id"] for t in self.q.order()],
+                         [short["id"], perf["id"], shot["id"]])
+        self.q.release(leases[0]["id"], 0)
+        self.assertTrue(self.running(short))
+        self.assertFalse(self.running(shot))
+
 
 class Duplicates(Box):
     """One job, asked for twice by one worktree."""
@@ -1411,9 +1425,24 @@ class CancelCommand(unittest.TestCase):
         code, sent, _ = self.run_cancel(tree="hats")
         self.assertEqual((code, sent), (0, ["J5", "J7"]))
 
-    def test_the_path_matches_too(self):
-        _, sent, _ = self.run_cancel(tree="weekend-features")
+    def test_a_fragment_of_a_name_cancels_nothing(self):
+        code, sent, out = self.run_cancel(tree="weekend")
+        self.assertEqual(sent, [])
+        self.assertIn("no queued jobs", out)
+
+    def test_the_whole_id_works_and_what_it_cancels_is_shown(self):
+        _, sent, out = self.run_cancel(tree="weekend-features-d4e5f6")
         self.assertEqual(sent, ["J6"])
+        self.assertIn("will cancel J6", out)
+
+    def test_a_name_shared_by_two_checkouts_is_refused(self):
+        state = {"queued": self.STATE["queued"] + [
+            {"id": "J8", "tree_id": "hats-ffffff", "tree_path": WT_A}], "running": []}
+        with mock.patch.object(
+                type(self), "STATE", state):
+            code, sent, out = self.run_cancel(tree="hats")
+        self.assertEqual((code, sent), (2, []))
+        self.assertIn("hats-ffffff", out)
 
     def test_an_id_that_is_gone_says_so_and_fails(self):
         code, sent, out = self.run_cancel(["J99"])
