@@ -85,6 +85,9 @@ DEFAULT_PORT = 43117
 # did not survive: eight shards ran the mfrs suite 1.6x faster than four
 # (152 s -> 94 s), and the old slowdown was other worktrees' engines. The box
 # is 16 cores and 24 threads.
+#
+# These are the defaults, sized for that box. Another machine says its own in
+# config.json (see load_capacity).
 CAPACITY = {"cpu": 8, "gpu": 2}
 
 # One card, two windows on it at once. It was one, and that was the queue's
@@ -401,6 +404,48 @@ def load_projects():
     except Exception:
         return {}
     return blob if isinstance(blob, dict) else {}
+
+
+def config_path():
+    return os.path.join(runtime_dir(), "config.json")
+
+
+def load_capacity():
+    """CAPACITY, with whatever this machine's config.json says instead.
+
+    {"capacity": {"cpu": 6, "gpu": 2}}
+
+    A file and not an environment variable because the daemon is started by
+    whichever client asks first, in that client's environment: a variable
+    would make the size of the box depend on which worktree got there. Read
+    when a daemon starts, so `start --restart` is what applies a change.
+
+    Either number may be left out. One that is not a whole number, or a `cpu`
+    under one, is ignored with a line in daemon.log: a typo must not leave a
+    queue that grants nothing. `gpu` may be 0, for a box with no card.
+    """
+    capacity = dict(CAPACITY)
+    try:
+        with open(config_path(), "r", encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except FileNotFoundError:
+        return capacity
+    except Exception as exc:
+        sys.stderr.write("config.json could not be read, using the defaults: %r\n" % (exc,))
+        return capacity
+    asked = blob.get("capacity") if isinstance(blob, dict) else None
+    if not isinstance(asked, dict):
+        return capacity
+    for key, least in (("cpu", 1), ("gpu", 0)):
+        if key not in asked:
+            continue
+        value = asked[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < least:
+            sys.stderr.write("config.json: capacity.%s is %r, keeping %d\n"
+                             % (key, value, capacity[key]))
+            continue
+        capacity[key] = value
+    return capacity
 
 
 def expand(path):
@@ -3361,7 +3406,7 @@ def cmd_serve(args):
     if args.takeover:
         try:
             conn, listener, inherited = take_over(port)
-            queue = Queue(inherited=inherited)
+            queue = Queue(load_capacity(), inherited=inherited)
             server = Server(("127.0.0.1", port), Handler, inherited=listener)
         except Exception as exc:
             sys.stderr.write("testq: could not take over on port %d: %r\n" % (port, exc))
@@ -3384,7 +3429,7 @@ def cmd_serve(args):
         moved = import_legacy_history()
         if moved:
             sys.stderr.write("imported %d row(s) from the old JSONL history\n" % moved)
-        queue = Queue()
+        queue = Queue(load_capacity())
     queue.sha = source_sha()
     queue.port = port
     stopping = threading.Event()
